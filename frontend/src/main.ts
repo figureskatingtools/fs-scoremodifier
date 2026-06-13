@@ -102,7 +102,7 @@ appElement.innerHTML = `
 
         <section id="opts-results" class="tool-panel hidden">
           <p class="lead">
-            Build a polished one-page <strong>Tulokset</strong> results sheet (PDF) — podium with
+            Build a polished one-page <strong>JudgesDetailsperSkater</strong> results sheet (PDF) — podium with
             scores plus everyone else in skating order — and a podium-only
             <strong>CAT###RS.htm</strong> page.
           </p>
