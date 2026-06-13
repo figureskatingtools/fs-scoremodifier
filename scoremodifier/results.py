@@ -192,8 +192,10 @@ def _label(page, x, y, s, size=7.0, color=INK_MUTED, font=F_BOLD, tracking=None)
 
 # --- sections ---------------------------------------------------------------
 def _draw_header(page, meta: ResultsMeta) -> float:
-    # gradient top bar
-    page.insert_image(fitz.Rect(0, 0, _PAGE_W, 8), pixmap=_gradient_pixmap(_GRAD))
+    # gradient top bar — keep_proportion=False so the narrow pixmap stretches
+    # edge to edge instead of being centered with white gaps on the sides
+    page.insert_image(fitz.Rect(0, 0, _PAGE_W, 8), pixmap=_gradient_pixmap(_GRAD),
+                      keep_proportion=False)
 
     # logo top-right
     try:
@@ -325,8 +327,10 @@ def _draw_others(page, teams: list[TeamResult], y: float) -> float:
     rows = (len(teams) + 1) // 2
     rh = 23.0
     for i, t in enumerate(teams):
-        col = i % 2  # row-major: left cell, then right cell, then next row down
-        row = i // 2
+        # column-major: fill the left column top-to-bottom, then the right one,
+        # so skating order reads down each column rather than zig-zagging
+        col = i // rows
+        row = i % rows
         x = _M + col * (cw + gap)
         ry = y + row * rh
         if row % 2 == 0:

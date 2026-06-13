@@ -36,6 +36,23 @@ OUTPUT_FILENAME = "per-skater.pdf"
 # Results-summary outputs.
 RESULTS_PDF_FILENAME = "results.pdf"
 DEFAULT_SUPERTITLE = "MUODOSTELMALUISTELU · VAPAAOHJELMA"
+# The Tulokkaat category re-uses the original FSM export filename so the results
+# PDF drops straight into the existing publishing workflow. Other categories get
+# a generic name unless the operator overrides it (pdfFile query param).
+TULOKKAAT_PDF_FILENAME = "FSKXSYNCHRONMLTULO--01FNL-000100--_JudgesDetailsperSkater.pdf"
+
+
+def _safe_pdf_filename(name: str, fallback: str) -> str:
+    """Sanitize an operator-supplied PDF filename: strip any path, keep simple
+    characters, and guarantee a .pdf extension. Falls back when nothing usable
+    remains."""
+    name = (name or "").replace("\\", "/").split("/")[-1].strip()
+    name = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", ".")).strip()
+    if not name:
+        return fallback
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
+    return name
 
 # Hosts the parse_index endpoint may fetch (SSRF guard). Override via env
 # INDEX_ALLOWED_HOSTS (comma-separated); defaults to the public results service.
@@ -550,6 +567,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
     supertitle = p.get("supertitle", "") or DEFAULT_SUPERTITLE
     cat_file = p.get("catFile", "")
     index_url = p.get("indexUrl", "")
+    pdf_file = p.get("pdfFile", "")
 
     if index_url:
         try:
@@ -583,6 +601,17 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
     html_filename = cat_file or "results.htm"
     name = " — ".join([x for x in (meta.category, meta.competition) if x]) or "Results"
 
+    # Download filename for the results PDF. Tulokkaat re-uses the standard FSM
+    # export name; other categories default to a generic name but the operator
+    # can override it (pdfFile). The blob is named accordingly so the SAS link
+    # downloads with this filename.
+    default_pdf_filename = (
+        TULOKKAAT_PDF_FILENAME
+        if meta.category.strip().upper() == "TULOKKAAT"
+        else RESULTS_PDF_FILENAME
+    )
+    pdf_filename = _safe_pdf_filename(pdf_file, default_pdf_filename)
+
     try:
         blob_service_client = get_blob_service_client()
         if not blob_service_client:
@@ -602,7 +631,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
 
         container = get_container_client(blob_service_client)
         container.upload_blob(f"{folder}/source.pdf", pdf_bytes, overwrite=True)
-        pdf_blob = f"{folder}/output/{RESULTS_PDF_FILENAME}"
+        pdf_blob = f"{folder}/output/{pdf_filename}"
         html_blob = f"{folder}/output/{html_filename}"
         container.upload_blob(pdf_blob, results_pdf, overwrite=True)
         container.upload_blob(html_blob, results_html, overwrite=True)
@@ -630,7 +659,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
         })
 
         download_url, expiration = create_and_store_sas_link(
-            blob_service_client, CONTAINER_NAME, pdf_blob, new_id, RESULTS_PDF_FILENAME,
+            blob_service_client, CONTAINER_NAME, pdf_blob, new_id, pdf_filename,
             len(results_pdf), description="Results summary (PDF)",
         )
         html_url, _ = create_and_store_sas_link(
@@ -641,7 +670,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(json.dumps({
             "id": new_id,
             "name": name,
-            "fileName": RESULTS_PDF_FILENAME,
+            "fileName": pdf_filename,
             "downloadUrl": download_url,
             "htmlFileName": html_filename,
             "htmlUrl": html_url,

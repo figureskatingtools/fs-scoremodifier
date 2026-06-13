@@ -32,6 +32,16 @@ interface GenerateResult {
 type Tool = 'perskater' | 'results';
 let activeTool: Tool = 'perskater';
 
+// Tulokkaat re-uses the original FSM export name (kept in sync with the backend
+// default) so the results PDF drops straight into the publishing workflow.
+const TULOKKAAT_PDF_FILENAME = 'FSKXSYNCHRONMLTULO--01FNL-000100--_JudgesDetailsperSkater.pdf';
+
+/** The default results PDF download name for the current category. */
+function defaultResultsFilename(): string {
+    const cat = (document.getElementById('r-category') as HTMLInputElement).value.trim().toUpperCase();
+    return cat === 'TULOKKAAT' ? TULOKKAAT_PDF_FILENAME : 'results.pdf';
+}
+
 const appElement = document.querySelector<HTMLDivElement>('#app')!;
 
 // The shared site nav (across all figureskatingtools.com apps) is rendered into
@@ -119,6 +129,15 @@ appElement.innerHTML = `
               <input id="r-category" class="form-input" value="TULOKKAAT"></div>
             <div class="field"><label class="form-label" for="r-supertitle">Supertitle</label>
               <input id="r-supertitle" class="form-input" value="MUODOSTELMALUISTELU · VAPAAOHJELMA"></div>
+          </div>
+          <label class="checkbox-row" style="display: flex; align-items: center; gap: 0.6rem; margin: 1rem 0 0.25rem;">
+            <input type="checkbox" id="r-custom-filename">
+            <span>Customize export filename
+              <span class="text-muted">(Tulokkaat uses the standard FSM filename automatically)</span></span>
+          </label>
+          <div class="field hidden" id="r-filename-field">
+            <label class="form-label" for="r-filename">Export filename (PDF)</label>
+            <input id="r-filename" class="form-input">
           </div>
         </section>
 
@@ -229,6 +248,7 @@ async function runPerSkater() {
 async function runResults() {
     const resultArea = document.getElementById('result-area')!;
     const val = (id: string) => (document.getElementById(id) as HTMLInputElement | HTMLSelectElement).value.trim();
+    const customFilename = (document.getElementById('r-custom-filename') as HTMLInputElement).checked;
     const params = new URLSearchParams({
         competition: val('r-competition'),
         date: val('r-date'),
@@ -237,6 +257,8 @@ async function runResults() {
         supertitle: val('r-supertitle'),
         catFile: val('r-catpage'),
         indexUrl: val('idx-url'),
+        // Blank → backend applies the category default (Tulokkaat = FSM name)
+        pdfFile: customFilename ? val('r-filename') : '',
     });
     const resp = await fetch(`/api/generate_results?${params.toString()}`, {
         method: 'POST',
@@ -365,6 +387,14 @@ function wireTool() {
     document.getElementById('tab-perskater')!.addEventListener('click', () => switchTool('perskater'));
     document.getElementById('tab-results')!.addEventListener('click', () => switchTool('results'));
     document.getElementById('idx-fetch')!.addEventListener('click', fetchIndex);
+
+    const customFn = document.getElementById('r-custom-filename') as HTMLInputElement;
+    const fnField = document.getElementById('r-filename-field')!;
+    const fnInput = document.getElementById('r-filename') as HTMLInputElement;
+    customFn.addEventListener('change', () => {
+        fnField.classList.toggle('hidden', !customFn.checked);
+        if (customFn.checked && !fnInput.value.trim()) fnInput.value = defaultResultsFilename();
+    });
 }
 
 async function init() {
