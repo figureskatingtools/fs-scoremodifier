@@ -82,7 +82,7 @@ appElement.innerHTML = `
         </div>
 
         <div id="upload-area" class="upload-area" style="margin: 1.25rem 0;">
-          <p class="upload-title">Drag &amp; drop the "Judges Details Per Skater" PDF here</p>
+          <p class="upload-title">Drag &amp; drop your "Judges Details Per Skater" PDF here</p>
           <p class="upload-or">or</p>
           <button id="browse-files-btn" class="btn btn-sm btn-primary" type="button">Browse Files</button>
           <input type="file" id="file-input" accept="application/pdf,.pdf" style="display: none;">
