@@ -192,7 +192,7 @@ async function runGenerate() {
             <div class="result-card">
                 <p class="status-success">Done — ${data.pages} page${data.pages === 1 ? '' : 's'} created.</p>
                 <p class="text-muted">${escapeHtml(data.name)}</p>
-                <a class="btn btn-primary" href="${encodeURI(data.downloadUrl)}" download="${escapeHtml(data.fileName)}">
+                <a class="btn btn-primary" href="${escapeHtml(data.downloadUrl)}" download="${escapeHtml(data.fileName)}">
                     Download ${escapeHtml(data.fileName)}
                 </a>
             </div>
