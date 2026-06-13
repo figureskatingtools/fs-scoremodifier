@@ -292,51 +292,77 @@ jobs:
       - name: Deploy to Azure Web App
         run: |
           WEBAPP_NAME="${{ needs.deploy-infra.outputs.web_app_name }}"
+          RESOURCE_GROUP="${{ needs.deploy-infra.outputs.resource_group_name }}"
           SCM_URL="https://${WEBAPP_NAME}.scm.azurewebsites.net"
           TOKEN=$(az account get-access-token --query accessToken -o tsv)
 
+          # --max-time guards against a hung curl stalling the whole step.
+          deployments_latest() {
+            curl -s --max-time 30 -H "Authorization: Bearer $TOKEN" "$SCM_URL/api/deployments/latest"
+          }
           latest_field() {
-            curl -s -H "Authorization: Bearer $TOKEN" "$SCM_URL/api/deployments/latest" \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$1',''))" 2>/dev/null || echo ""
+            deployments_latest | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$1',''))" 2>/dev/null || echo ""
           }
 
-          # Remember the previous deployment so we don't mistake it for the new one
-          PRE_ID=$(latest_field id)
+          # The preceding "Configure Web App settings" / "Disable token store"
+          # steps are management operations that restart the SCM container.
+          # Deploying while that restart is in flight aborts the deploy
+          # (status 3, "stopped due to SCM container restart"). Let it settle.
+          echo "Letting the site settle after configuration changes..."
+          sleep 90
 
-          # Async deploy + poll: the synchronous wait regularly trips a gateway
-          # 504 after ~4 minutes even though the deployment succeeds server-side.
-          # --track-status false: skip the CLI's own "wait for site to start"
-          # poll, which trips a false 10-min timeout on B1 (the site does start,
-          # just slowly). The Kudu poll loop below is the authoritative check.
-          az webapp deploy \
-            --resource-group "${{ needs.deploy-infra.outputs.resource_group_name }}" \
-            --name "$WEBAPP_NAME" \
-            --src-path frontend.zip \
-            --type zip \
-            --clean true \
-            --async true \
-            --track-status false
+          # One async deploy + Kudu poll. Returns: 0=success, 2=retryable
+          # SCM-restart abort, 1=hard failure/timeout. --track-status false skips
+          # the CLI's own site-start wait (false 10-min timeout on B1); the poll
+          # below is the authoritative check.
+          attempt_deploy() {
+            local PRE_ID ID STATUS COMPLETE
+            PRE_ID=$(latest_field id)
+            az webapp deploy \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$WEBAPP_NAME" \
+              --src-path frontend.zip \
+              --type zip \
+              --clean true \
+              --async true \
+              --track-status false || true
 
-          # Poll Kudu for the new deployment's result (status 4 = success, 3 = failed)
-          for i in $(seq 1 40); do
-            sleep 15
-            ID=$(latest_field id)
-            if [[ -z "$ID" || "$ID" == "$PRE_ID" ]]; then
-              echo "Waiting for new deployment to register..."
+            for i in $(seq 1 24); do
+              sleep 15
+              ID=$(latest_field id)
+              if [[ -z "$ID" || "$ID" == "$PRE_ID" ]]; then
+                echo "Waiting for new deployment to register..."
+                continue
+              fi
+              STATUS=$(latest_field status)
+              COMPLETE=$(latest_field complete)
+              if [[ "$STATUS" == "4" && "$COMPLETE" == "True" ]]; then
+                echo "Deployment $ID succeeded."
+                return 0
+              elif [[ "$STATUS" == "3" ]]; then
+                echo "Deployment $ID failed:"
+                deployments_latest
+                if deployments_latest | grep -qi "SCM container restart"; then
+                  return 2
+                fi
+                return 1
+              fi
+              echo "Deployment $ID in progress (status=${STATUS:-unknown})..."
+            done
+            echo "Timed out waiting for deployment to complete."
+            return 1
+          }
+
+          for attempt in 1 2 3; do
+            echo "=== Deploy attempt $attempt ==="
+            attempt_deploy && exit 0
+            rc=$?
+            if [[ $rc -eq 2 ]]; then
+              echo "Deploy aborted by an SCM container restart; waiting 60s before retry..."
+              sleep 60
               continue
             fi
-            STATUS=$(latest_field status)
-            COMPLETE=$(latest_field complete)
-            if [[ "$STATUS" == "4" && "$COMPLETE" == "True" ]]; then
-              echo "Deployment $ID succeeded."
-              exit 0
-            elif [[ "$STATUS" == "3" ]]; then
-              echo "Deployment $ID failed:"
-              curl -s -H "Authorization: Bearer $TOKEN" "$SCM_URL/api/deployments/latest"
-              exit 1
-            fi
-            echo "Deployment $ID in progress (status=${STATUS:-unknown})..."
+            exit $rc
           done
-
-          echo "Timed out waiting for deployment to complete."
+          echo "All deploy attempts failed after retries."
           exit 1
