@@ -1,0 +1,57 @@
+# Dependabot version updates. Weekly, grouped into one PR per ecosystem,
+# targeting `test` so updates flow through the normal test -> verify ->
+# promote-to-main process instead of auto-deploying prod on merge.
+#
+# NOTE: this file is only read from the default branch (main).
+# NOTE: resolving @figureskatingtools/shared-ui from GitHub Packages requires
+# a Dependabot secret PACKAGES_READ_TOKEN (classic PAT with read:packages),
+# set under Settings -> Secrets and variables -> Dependabot.
+version: 2
+
+registries:
+  github-npm:
+    type: npm-registry
+    url: https://npm.pkg.github.com
+    token: ${{ secrets.PACKAGES_READ_TOKEN }}
+
+updates:
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    registries:
+      - github-npm
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Europe/Helsinki"
+    target-branch: "test"
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    directory: "/infra/functions"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Europe/Helsinki"
+    target-branch: "test"
+    groups:
+      pip-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Europe/Helsinki"
+    target-branch: "test"
+    groups:
+      actions-dependencies:
+        patterns:
+          - "*"
