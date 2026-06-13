@@ -17,6 +17,11 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import TableClient, UpdateMode
 
 from scoremodifier.per_skater import split_per_skater, NotPerSkaterReport
+from scoremodifier.extract import extract_results
+from scoremodifier.model import ResultsMeta
+from scoremodifier.results import render_results_pdf
+from scoremodifier.results_html import render_results_html
+from scoremodifier.index_meta import fetch_index_html, parse_index_html, match_category
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -28,6 +33,20 @@ MAX_UPLOAD_SIZE = 25 * 1024 * 1024
 
 # Generated output filename (one per generation).
 OUTPUT_FILENAME = "per-skater.pdf"
+# Results-summary outputs.
+RESULTS_PDF_FILENAME = "results.pdf"
+DEFAULT_SUPERTITLE = "MUODOSTELMALUISTELU · VAPAAOHJELMA"
+
+# Hosts the parse_index endpoint may fetch (SSRF guard). Override via env
+# INDEX_ALLOWED_HOSTS (comma-separated); defaults to the public results service.
+INDEX_ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.environ.get(
+        "INDEX_ALLOWED_HOSTS",
+        "www.figureskatingresults.fi,figureskatingresults.fi",
+    ).split(",")
+    if h.strip()
+]
 
 # Automatic competition deletion: lifetime after creation and the per-extend
 # bump. Rows missing a DeletionDate get backfilled with the migration date.
@@ -247,7 +266,7 @@ def _ensure_deletion_date(comp_table, entity):
     return entity
 
 
-def create_and_store_sas_link(blob_service_client, container_name, blob_name, competition, filename, file_size=0):
+def create_and_store_sas_link(blob_service_client, container_name, blob_name, competition, filename, file_size=0, description="Per-skater scores (PDF)"):
     """Create a 5-day read SAS for a generated blob, store it as a generatedpapers row, and return (url, expiry_iso)."""
     try:
         table_client = get_table_client()
@@ -309,7 +328,7 @@ def create_and_store_sas_link(blob_service_client, container_name, blob_name, co
             "RowKey": filename.replace('/', '_').replace('\\', '_'),
             "Url": full_url,
             "ExpirationDate": expiry.isoformat(),
-            "Description": "Per-skater scores (PDF)",
+            "Description": description,
             "FileName": filename,
             "FileSize": int(file_size),
         }
@@ -448,6 +467,189 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
         }), mimetype="application/json")
     except Exception as e:
         logging.error(f"Error storing generated PDF: {e}", exc_info=True)
+        return func.HttpResponse("Error processing request. Check server logs for details.", status_code=500)
+
+
+@app.route(route="parse_index", auth_level=func.AuthLevel.ANONYMOUS)
+def parse_index(req: func.HttpRequest) -> func.HttpResponse:
+    """Fetch + parse a competition index.htm URL.
+
+    Returns competition name/date/venue and the category result pages
+    (CAT###RS.htm). Fetching is restricted to INDEX_ALLOWED_HOSTS (SSRF guard).
+    """
+    email = get_user_email_from_header(req)
+    if not email:
+        return func.HttpResponse("Unauthorized", status_code=401)
+
+    url = req.params.get("url")
+    if not url:
+        return func.HttpResponse("Missing url parameter", status_code=400)
+
+    try:
+        html = fetch_index_html(url, allowed_hosts=INDEX_ALLOWED_HOSTS)
+    except ValueError as e:
+        return func.HttpResponse(str(e), status_code=400)
+    except Exception as e:
+        logging.warning(f"Could not fetch index page {url}: {e}")
+        return func.HttpResponse("Could not fetch the index page.", status_code=502)
+
+    meta = parse_index_html(html)
+    return func.HttpResponse(json.dumps({
+        "competition": meta.competition,
+        "date": meta.date,
+        "venue": meta.venue,
+        "categories": [{"name": c.name, "catFile": c.cat_file} for c in meta.categories],
+    }), mimetype="application/json")
+
+
+@app.route(route="generate_results", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+def generate_results(req: func.HttpRequest) -> func.HttpResponse:
+    """Build a polished podium 'Tulokset' results page from an uploaded report.
+
+    Body = the per-skater PDF. Query: competition, date, venue, category,
+    supertitle, catFile, indexUrl (optional; fills blank fields + matches the
+    CAT page). Produces a results PDF + a podium-only CAT###RS.htm, stores both,
+    and returns their download URLs.
+    """
+    logging.info('Generating results summary...')
+
+    email = get_user_email_from_header(req)
+    if not email:
+        return func.HttpResponse("Unauthorized", status_code=401)
+    if not is_user_allowed(email):
+        return func.HttpResponse("Forbidden: You are not on the allow list.", status_code=403)
+
+    content_length = req.headers.get('Content-Length')
+    if content_length and int(content_length) > MAX_UPLOAD_SIZE:
+        return func.HttpResponse(f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024*1024)} MB.", status_code=413)
+
+    pdf_bytes = req.get_body()
+    if not pdf_bytes:
+        return func.HttpResponse("No file provided", status_code=400)
+    if len(pdf_bytes) > MAX_UPLOAD_SIZE:
+        return func.HttpResponse(f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024*1024)} MB.", status_code=413)
+    if not pdf_bytes[:5].startswith(b'%PDF'):
+        return func.HttpResponse("Only PDF files are allowed", status_code=400)
+
+    try:
+        teams, segment = extract_results(pdf_bytes)
+    except NotPerSkaterReport:
+        return func.HttpResponse(
+            "This doesn't look like a 'JUDGES DETAILS PER SKATER' export. Please upload that report.",
+            status_code=400,
+        )
+    except Exception as e:
+        logging.error(f"Error extracting results: {e}", exc_info=True)
+        return func.HttpResponse("Could not read the PDF. Check that it is a valid report.", status_code=500)
+
+    p = req.params
+    competition = p.get("competition", "")
+    date = p.get("date", "")
+    venue = p.get("venue", "")
+    category = p.get("category", "")
+    supertitle = p.get("supertitle", "") or DEFAULT_SUPERTITLE
+    cat_file = p.get("catFile", "")
+    index_url = p.get("indexUrl", "")
+
+    if index_url:
+        try:
+            idx = parse_index_html(fetch_index_html(index_url, allowed_hosts=INDEX_ALLOWED_HOSTS))
+            competition = competition or idx.competition
+            date = date or idx.date
+            venue = venue or idx.venue
+            matched = match_category(idx, segment)
+            if matched:
+                category = category or matched.name
+                cat_file = cat_file or matched.cat_file
+        except Exception as e:
+            logging.warning(f"Could not use index URL {index_url}: {e}")
+
+    meta = ResultsMeta(
+        competition=competition,
+        date=date,
+        venue=venue,
+        category=category or segment,
+        supertitle=supertitle,
+        team_count=len(teams),
+    )
+
+    try:
+        results_pdf = render_results_pdf(meta, teams)
+        results_html = render_results_html(meta, teams).encode("utf-8")
+    except Exception as e:
+        logging.error(f"Error rendering results: {e}", exc_info=True)
+        return func.HttpResponse("Could not render the results page.", status_code=500)
+
+    html_filename = cat_file or "results.htm"
+    name = " — ".join([x for x in (meta.category, meta.competition) if x]) or "Results"
+
+    try:
+        blob_service_client = get_blob_service_client()
+        if not blob_service_client:
+            return func.HttpResponse("Storage configuration not found", status_code=500)
+
+        comp_table = get_table_client("competitions")
+        if not comp_table:
+            return func.HttpResponse("Storage configuration invalid", status_code=500)
+        try:
+            comp_table.create_table()
+        except Exception:
+            pass
+
+        new_id = generate_competition_id(comp_table)
+        safe = sanitize_name(name) or "results"
+        folder = f"{safe}-{new_id}"
+
+        container = get_container_client(blob_service_client)
+        container.upload_blob(f"{folder}/source.pdf", pdf_bytes, overwrite=True)
+        pdf_blob = f"{folder}/output/{RESULTS_PDF_FILENAME}"
+        html_blob = f"{folder}/output/{html_filename}"
+        container.upload_blob(pdf_blob, results_pdf, overwrite=True)
+        container.upload_blob(html_blob, results_html, overwrite=True)
+
+        now = datetime.utcnow()
+        comp_table.create_entity({
+            "PartitionKey": "GLOBAL",
+            "RowKey": new_id,
+            "Name": name,
+            "FolderPath": folder,
+            "Segment": segment,
+            "Competition": meta.competition,
+            "CompetitionDate": meta.date,
+            "Venue": meta.venue,
+            "Category": meta.category,
+            "Tool": "results",
+            "CatFile": html_filename,
+            "OutputPages": 1,
+            "Visible": True,
+            "CreatedBy": email,
+            "CreatedDate": f"{now.isoformat()}Z",
+            "DeletionDate": f"{(now + timedelta(days=DELETION_RETENTION_DAYS)).isoformat()}Z",
+            "UploadedFileCount": 1,
+            "GenerateRunCount": 1,
+        })
+
+        download_url, expiration = create_and_store_sas_link(
+            blob_service_client, CONTAINER_NAME, pdf_blob, new_id, RESULTS_PDF_FILENAME,
+            len(results_pdf), description="Results summary (PDF)",
+        )
+        html_url, _ = create_and_store_sas_link(
+            blob_service_client, CONTAINER_NAME, html_blob, new_id, html_filename,
+            len(results_html), description="Podium results page (HTML)",
+        )
+
+        return func.HttpResponse(json.dumps({
+            "id": new_id,
+            "name": name,
+            "fileName": RESULTS_PDF_FILENAME,
+            "downloadUrl": download_url,
+            "htmlFileName": html_filename,
+            "htmlUrl": html_url,
+            "pages": 1,
+            "expiration": expiration,
+        }), mimetype="application/json")
+    except Exception as e:
+        logging.error(f"Error storing results: {e}", exc_info=True)
         return func.HttpResponse("Error processing request. Check server logs for details.", status_code=500)
 
 

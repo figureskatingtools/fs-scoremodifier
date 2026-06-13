@@ -5,13 +5,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What This Is
 
 A figureskatingtools.com tool (sibling of `../fs-judgepapers`, landing site `../figureskatingtools-site`)
-that reshapes figure skating result PDFs. The first and currently only tool, **per-skater**, takes a
-Figure Skating Manager (FSM) **"Judges Details Per Skater"** export — where each page stacks 2–3
-skaters/teams under a repeating header — and rebuilds it so **each skater gets their own page** (rank
-order), keeping the original header + legend, replacing the `Page X / Y` footer with a credit line, and
-optionally removing the rank number for everyone outside the podium. Currently used for the **Tulokkaat
-(Beginners)** category. The frontend is a single page: upload one PDF, tick *Include ranks* (off by
-default), Generate, download.
+that reshapes figure skating result PDFs. Both tools take the same Figure Skating Manager (FSM)
+**"Judges Details Per Skater"** export (each page stacks 2–3 skaters/teams under a repeating header):
+
+- **per-skater** rebuilds it so **each skater gets their own page** (rank order), keeping the original
+  header + legend, replacing the `Page X / Y` footer with a credit line, and optionally removing the
+  rank number for everyone outside the podium.
+- **results** (Tulokkaat podium style) builds a polished one-page **"Tulokset"** summary PDF — branded
+  header, competition info bar, podium cards (ranks 1–3, ties allowed, with total scores) and a
+  two-column "Muut joukkueet" list of everyone else in **skating order** (no rank/score) — **and** a
+  podium-only `CAT###RS.htm` HTML page. Competition name/date/venue + the matching `CAT###RS.htm`
+  filename are pulled from the competition `index.htm` URL (parsed server-side).
+
+Currently used for the **Tulokkaat (Beginners)** category. The frontend is a single page with two tabs
+(one shared PDF upload): per-skater (tick *Include ranks*, off by default) and results summary (paste
+the index.htm URL → auto-fill, Generate → PDF + HTML).
+
+> **Architecture note:** the results tool is split into an *extraction layer*
+> (`scoremodifier/extract.py` → `model.TeamResult`/`ResultsMeta`) feeding *renderers* (`results.py`
+> PDF, `results_html.py` HTML). Planned future renderers (per-team SendGrid result emails) reuse the
+> same extracted data instead of re-parsing. `index_meta.py` parses the FSM/Swiss-Timing index.htm
+> (stdlib only, no bs4).
 
 ## Commands
 
@@ -20,6 +34,10 @@ default), Generate, download.
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m scoremodifier per-skater input.pdf -o out.pdf [--hide-non-podium-ranks]
+# Results summary PDF + podium-only CAT###RS.htm (name/date/venue + CAT file from the index URL)
+python -m scoremodifier results input.pdf -o results.pdf \
+  --index-url https://www.figureskatingresults.fi/results/2526/<COMP>/index.htm --category TULOKKAAT \
+  [--html-out CAT003RS.htm] [--competition … --date … --venue … --supertitle …]
 
 # Full local stack (Functions :7071 + Vite :5173 + SWA emulator :4280)
 ./start_locally.sh        # sets PYTHONPATH so the function can import the core package
@@ -63,12 +81,17 @@ Four pieces:
    the `Rank` word on its middle line, so block tops are found `~7pt` above the `Rank` anchor).
 
 2. **Backend** (`infra/functions/`) — Python Azure Functions (Flex Consumption, Python 3.11), HTTP-
-   triggered, in `function_app.py`. The UI calls one endpoint, **`generate`** (POST, body = the PDF,
-   `?includeRanks=true|false`, default `false` ⇒ `hide_non_podium_ranks=True`): it runs
+   triggered, in `function_app.py`. **`generate`** (POST, body = the PDF,
+   `?includeRanks=true|false`, default `false` ⇒ `hide_non_podium_ranks=True`): runs
    `split_per_skater`, derives a name from the PDF (`<segment> — <printed date>`, page-0 text), stores
    `source.pdf` + `output/per-skater.pdf` in blob storage, writes a `competitions` row + a
-   `generatedpapers` row with a 5-day read SAS link, and returns the download URL. `check_user_permission`
-   is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
+   `generatedpapers` row with a 5-day read SAS link, and returns the download URL. **`generate_results`**
+   (POST, body = the PDF, metadata via query params `competition/date/venue/category/supertitle/catFile/indexUrl`):
+   runs `extract_results` → `render_results_pdf` + `render_results_html`, stores `output/results.pdf`
+   + `output/<CAT###RS>.htm`, writes a `competitions` row (`Tool="results"`) + a `generatedpapers` row
+   per file, returns both URLs. **`parse_index`** (GET `?url=`) fetches + parses the competition
+   index.htm (SSRF-guarded to `INDEX_ALLOWED_HOSTS`, default `figureskatingresults.fi`) → name/date/venue
+   + category `CAT###RS.htm` list. `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
    and a daily 30-day auto-delete timer are mirrored from judgepapers for future features / storage
    hygiene (not wired to the current UI). The auth/storage/SAS helpers are reused verbatim from
    judgepapers. **The function imports `scoremodifier.per_skater`**; the canonical package lives at the
