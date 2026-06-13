@@ -35,6 +35,9 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
     siteConfig: {
       linuxFxVersion: 'NODE|22-lts'
       appCommandLine: 'node server.js'
+      // Keep the worker resident so zip deploys don't race the B1 cold-start
+      // timeout (container can exceed the 230s start limit on a cold pull).
+      alwaysOn: true
     }
     httpsOnly: true
   }

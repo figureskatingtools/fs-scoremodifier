@@ -9,6 +9,7 @@ import re
 
 import fitz  # PyMuPDF — used to derive the competition name and count output pages
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from uuid import uuid4
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 from azure.identity import DefaultAzureCredential
@@ -264,7 +265,13 @@ def create_and_store_sas_link(blob_service_client, container_name, blob_name, co
         sas_token = ""
 
         account_name = blob_service_client.account_name
-        blob_url_base = f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}"
+        # Percent-encode the path (folder names keep spaces/special chars per
+        # sanitize_name). Without this the stored URL carries raw spaces, and a
+        # browser re-encoding the whole URL double-encodes the SAS query, which
+        # Azure rejects with "Signature fields not well formed". safe='/' keeps
+        # the path separators intact; the SAS token below is already encoded.
+        encoded_path = quote(f"{container_name}/{blob_name}", safe="/")
+        blob_url_base = f"https://{account_name}.blob.core.windows.net/{encoded_path}"
 
         if os.environ.get("AzureWebJobsStorage__accountName"):
             ud_key = blob_service_client.get_user_delegation_key(start_time, expiry)
