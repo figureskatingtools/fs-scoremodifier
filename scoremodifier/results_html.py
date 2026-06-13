@@ -1,143 +1,118 @@
-"""Render a podium-only results page as standalone HTML (the CAT###RS.htm output).
+"""Render the podium-only ``CAT###RS.htm`` page in the native Swiss-Timing /
+FSM result-page format.
 
 This is the second renderer over the shared
 :class:`~scoremodifier.model.TeamResult` / :class:`~scoremodifier.model.ResultsMeta`
-data (the PDF renderer in :mod:`scoremodifier.results` is the first). Per the
-publishing convention it lists **only podium competitors and their total
-points** — no skating-order section.
+data (the PDF renderer in :mod:`scoremodifier.results` is the first). Unlike the
+PDF, this file is meant to drop straight into the official results directory
+beside the real ``CAT###RS.htm`` pages, so it reproduces their exact markup
+(``../Styles.css`` / ``../Print.css``, the ``evt_header.jpg`` banner, the
+``../flags/<ABBR>.GIF`` nation flags and the standard footer) rather than the
+branded figureskatingtools styling. Per the publishing convention it lists only
+the **podium** competitors (ranks 1-3) with their total points.
 
-The output is a single self-contained HTML document (inline CSS, web fonts +
-logo by URL) so it can be dropped in beside the official FSM ``CAT###RS.htm``.
+The only data-driven parts are the page ``<title>``, the category caption, the
+"last update" stamp and the result rows; everything else is the template the
+results service emits verbatim.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from html import escape
 
 from .model import ResultsMeta, TeamResult, podium_teams
 
-# Brand assets/fonts served from the tool's own domain (keeps the file small;
-# the page degrades gracefully if offline).
-LOGO_URL = "https://scoremodifier.figureskatingtools.com/logo.png"
-_FONTS = (
-    "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700"
-    "&family=Instrument+Sans:wght@400;500;600;700&display=swap"
-)
 
-_MEDAL = {1: "#b08d2f", 2: "#9da9b3", 3: "#c48d63"}
+def _last_update() -> str:
+    """A 'DD.MM.YYYY HH:MM (UTC +HH:MM)' stamp in Finnish local time, matching
+    the format the live results service prints (DST-aware via zoneinfo)."""
+    try:
+        from zoneinfo import ZoneInfo
 
-_CSS = """
-:root{--ink:#0d1f33;--ink-soft:#3c5168;--ink-muted:#64798e;--line:#dde6ee;
---rink:#1271b5;--rink-tint:#e9f1f8;--paper:#fff;--frost:#eef3f7}
-*{box-sizing:border-box}
-body{margin:0;background:linear-gradient(180deg,#f3f7fa,#eef3f7 38%,#e7eef4);
-font-family:'Instrument Sans',system-ui,sans-serif;color:var(--ink);
--webkit-font-smoothing:antialiased;padding:32px 16px}
-.sheet{max-width:840px;margin:0 auto;background:var(--paper);border:1px solid var(--line);
-border-radius:18px;overflow:hidden;box-shadow:0 12px 32px -8px rgb(13 31 51/.18)}
-.bar{height:8px;background:linear-gradient(90deg,#28b4d2,#1271b5 50%,#6d3fb5)}
-.pad{padding:34px 40px 40px}
-.top{display:flex;justify-content:space-between;align-items:flex-start;gap:24px}
-.eyebrow{font-size:12px;letter-spacing:.18em;font-weight:700;color:var(--rink);
-text-transform:uppercase;margin:0 0 6px}
-h1{font-family:'Fraunces',Georgia,serif;font-weight:700;font-size:46px;line-height:1;
-margin:0 0 14px;letter-spacing:-.01em}
-.logo{height:64px;flex:none}
-.pill{display:inline-block;background:linear-gradient(90deg,#105696,#5f37a5);color:#fff;
-font-weight:700;font-size:12px;letter-spacing:.12em;text-transform:uppercase;
-padding:7px 16px;border-radius:999px}
-.info{display:grid;grid-template-columns:repeat(4,1fr);gap:0;border:1px solid var(--line);
-border-radius:12px;margin:24px 0 22px;overflow:hidden}
-.info div{padding:12px 16px}
-.info div+div{border-left:1px solid var(--line)}
-.info dt{font-size:10px;letter-spacing:.14em;font-weight:700;color:var(--ink-muted);
-text-transform:uppercase;margin:0 0 4px}
-.info dd{margin:0;font-weight:700;font-size:15px}
-.note{display:flex;gap:12px;background:var(--rink-tint);border-left:4px solid var(--rink);
-border-radius:10px;padding:14px 16px;color:var(--ink-soft);font-size:13.5px;line-height:1.45}
-.note .i{flex:none;width:20px;height:20px;border-radius:50%;background:var(--rink);color:#fff;
-font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center}
-h2{font-family:'Fraunces',Georgia,serif;font-size:24px;margin:26px 0 14px;display:flex;
-align-items:center;gap:14px}
-h2::after{content:"";flex:1;height:1px;background:var(--line)}
-.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
-.card{border:1px solid var(--line);border-radius:16px;padding:20px;background:var(--paper);
-display:flex;flex-direction:column;min-height:180px}
-.card.win{background:linear-gradient(135deg,#105696,#5f37a5);border:none;color:#fff}
-.card .head{display:flex;align-items:center;gap:10px;margin-bottom:14px}
-.medal{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;
-justify-content:center;font-weight:700;font-size:15px;color:#fff}
-.place{font-size:12px;letter-spacing:.14em;font-weight:700;text-transform:uppercase;
-color:var(--ink-muted)}
-.card.win .place{color:#cdd9ee}
-.team{font-family:'Fraunces',Georgia,serif;font-weight:700;font-size:22px;line-height:1.12;
-margin:0 0 4px}
-.club{font-size:14px;color:var(--ink-soft);margin:0}
-.card.win .club{color:#cdd9ee}
-.score{font-family:'Fraunces',Georgia,serif;font-weight:700;font-size:34px;margin:auto 0 2px}
-.plabel{font-size:10px;letter-spacing:.14em;font-weight:700;text-transform:uppercase;
-color:var(--ink-muted)}
-.card.win .plabel{color:#cdd9ee}
-.foot{text-align:center;color:var(--ink-muted);font-size:12.5px;margin:30px 0 0;
-padding-top:16px;border-top:1px solid var(--line)}
-@media(max-width:640px){.info,.cards{grid-template-columns:1fr}.info div+div{border-left:none;
-border-top:1px solid var(--line)}.pad{padding:24px}}
-"""
-
-_NOTE = (
-    "Tässä sarjassa julkaistaan ainoastaan palkintosijat (1.–3.) ja niiden "
-    "kokonaispisteet."
-)
-_FOOTER = "Created with Figureskatingtools.com — Supporting the Figure Skating Community."
+        now = datetime.now(ZoneInfo("Europe/Helsinki"))
+        off = now.strftime("%z")  # e.g. +0300
+        off = f"{off[:3]}:{off[3:]}" if len(off) == 5 else off
+        return f"{now.strftime('%d.%m.%Y %H:%M')} (UTC {off})"
+    except Exception:
+        return f"{datetime.utcnow().strftime('%d.%m.%Y %H:%M')} (UTC)"
 
 
-def _card(t: TeamResult) -> str:
-    win = " win" if t.rank == 1 else ""
-    return (
-        f'<div class="card{win}">'
-        f'<div class="head"><span class="medal" style="background:{_MEDAL.get(t.rank, "#1271b5")}">'
-        f"{t.rank}</span><span class=\"place\">Sija</span></div>"
-        f'<p class="team">{escape(t.name)}</p>'
-        f'<p class="club">{escape(t.club)}</p>'
-        f'<div class="score">{t.segment_score:.2f}</div>'
-        f'<div class="plabel">Kokonaispisteet</div>'
-        f"</div>"
-    )
+def _row(t: TeamResult, idx: int) -> str:
+    """One result row. Rows alternate Line1White / Line2White; the nation cell
+    shows the ``../flags/<ABBR-UPPERCASE>.GIF`` flag next to the abbreviation as
+    printed in the report. FPl. and FS both equal the (single-segment) rank."""
+    cls = "Line1White" if idx % 2 == 0 else "Line2White"
+    abbr = t.club.strip()
+    flag = abbr.upper()
+    return f"""                            <tr class="{cls}">
+                                <td>{t.rank}</td>
+                                <td class="CellLeft"><a class="disableBiosLink">{escape(t.name)}</a></td>
+                                <td><table><tr class="{cls}"><td><img src="../flags/{escape(flag)}.GIF"></td><td></td><td>{escape(abbr)}</td></tr></table></td>
+                                <td>{t.segment_score:.2f}</td>
+                                    <td>{t.rank}</td>
+                            </tr>"""
 
 
 def render_results_html(meta: ResultsMeta, teams: list[TeamResult]) -> str:
-    """Return a self-contained podium-only HTML results page (CAT###RS.htm)."""
-    if not meta.team_count:
-        meta.team_count = len(teams)
+    """Return the podium-only ``CAT###RS.htm`` page in Swiss-Timing markup."""
     podium = podium_teams(teams)
-    cards = "".join(_card(t) for t in podium)
-    info = "".join(
-        f"<div><dt>{escape(lbl)}</dt><dd>{escape(str(val) or '—')}</dd></div>"
-        for lbl, val in (
-            ("Kilpailu", meta.competition),
-            ("Päivämäärä", meta.date),
-            ("Paikkakunta", meta.venue),
-            ("Joukkueita", meta.team_count),
-        )
-    )
-    title = escape(f"{meta.title} — {meta.category} — {meta.competition}".strip(" —"))
-    return f"""<!DOCTYPE html>
-<html lang="fi"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="{_FONTS}" rel="stylesheet">
-<style>{_CSS}</style></head>
-<body><div class="sheet"><div class="bar"></div><div class="pad">
-<div class="top"><div>
-<p class="eyebrow">{escape(meta.supertitle)}</p>
-<h1>{escape(meta.title)}</h1>
-<span class="pill">{escape(meta.category)}</span>
-</div><img class="logo" src="{LOGO_URL}" alt="Figureskatingtools.com"></div>
-<dl class="info">{info}</dl>
-<div class="note"><span class="i">i</span><span>{escape(_NOTE)}</span></div>
-<h2>{escape("Palkintosijat")}</h2>
-<div class="cards">{cards}</div>
-<p class="foot">{escape(_FOOTER)}</p>
-</div></div></body></html>"""
+    rows = "\n".join(_row(t, i) for i, t in enumerate(podium))
+    cat = meta.category_full or meta.category  # proper-case name for the caption
+    category = escape(cat or meta.title or "")
+    title = escape(" - ".join(p for p in (meta.competition, cat) if p) or "Result")
+    year = datetime.utcnow().year
+    return f"""<html>
+<head>
+    <title>{title}</title>
+    <meta Http-Equiv="refresh" Content="30">
+    <link href="../Styles.css" rel="stylesheet" type="text/css" media="screen">
+    <link href="../Print.css" rel="stylesheet" type="text/css" media="print">
+    <link rel="shortcut icon" type="image/png" href="../favicon_clear.png">
+    <style>
+        .disableBiosLink {{
+            pointer-events: none;
+            cursor: default;
+            color: inherit;
+            text-decoration: inherit;
+        }}
+    </style>
+</head>
+<body class="PageBody">
+    <script src="/results/jquery.js" type="text/javascript"></script>
+    <script src="/results/default.js" type="text/javascript"></script>
+    <table class="MainTab" border="0" cellpadding="0" cellspacing="0">
+<tr><td><a href="https://www.isu-skating.com/"><img src="evt_header.jpg" border="0"></a></td></tr><tr class="EmptyLine14"><td>&nbsp;</td></tr>
+<tr class="caption2"><td>{category}</td></tr>
+<tr class="EmptyLine14"><td> &nbsp; </td></tr>
+<tr class="caption3"><td>Result</td></tr>
+<tr class="EmptyLine14"><td> &nbsp; </td></tr>
+<tr>
+    <td>
+        <table width="70%" border="0" align="center" cellpadding="0" cellspacing="1" bgcolor="#606060">
+            <tr>
+                <td>
+                    <table width="100%" align="center" border="0" cellspacing="1">
+                        <tr class="TabHeadWhite">
+                            <th>FPl.</th>
+                            <th>Name</th>
+                                                            <th>Nation</th>
+                            <th>Points</th>
+
+                                <th>FS</th>
+                        </tr>
+
+{rows}
+
+                    </table>
+                </td>
+            </tr>
+        </table>
+    </td>
+</tr><tr class="EmptyLine22"><td> &nbsp; </td></tr>
+<tr class="Link"><td><a href="index.htm">Back to Event Page</a> &nbsp; &nbsp; <a href="javascript:history.go (-1)">Back</a> &nbsp; &nbsp; <a href="https://www.isu-skating.com/">Back to Home Page</a> &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;<a href='mailto:figureskating@st-sportservice.com'>Contact result service</a> &nbsp; &nbsp; <a href="http://www.st-sportservice.com">Created by Swiss Timing, Ltd.</a></td></tr>
+<tr class="EmptyLine10"><td> &nbsp; </td></tr>
+<tr class="LastLine"><td>Last Update: {_last_update()} <br /> &copy; {year} <a href="https://www.isu-skating.com/">International Skating Union</a>. All Rights Reserved.</td></tr>
+</table>
+</body>
+</html>"""

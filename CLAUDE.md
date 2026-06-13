@@ -23,9 +23,14 @@ the index.htm URL → auto-fill, Generate → PDF + HTML).
 
 > **Architecture note:** the results tool is split into an *extraction layer*
 > (`scoremodifier/extract.py` → `model.TeamResult`/`ResultsMeta`) feeding *renderers* (`results.py`
-> PDF, `results_html.py` HTML). Planned future renderers (per-team SendGrid result emails) reuse the
-> same extracted data instead of re-parsing. `index_meta.py` parses the FSM/Swiss-Timing index.htm
-> (stdlib only, no bs4).
+> PDF, `results_html.py` HTML). The PDF is the branded figureskatingtools sheet; the HTML
+> (`CAT###RS.htm`) is deliberately **not** branded — it reproduces the **native Swiss-Timing result-page
+> markup** (`../Styles.css`/`../Print.css`, `evt_header.jpg`, `../flags/<ABBR-UPPERCASE>.GIF` nation
+> flags, standard footer) so it drops straight into the official results directory beside the real
+> pages. Its caption uses `ResultsMeta.category_full` (proper-case index name, e.g. "Tulokkaat L1"),
+> distinct from `category` (the PDF badge, e.g. "TULOKKAAT"). Planned future renderers (per-team
+> SendGrid result emails) reuse the same extracted data instead of re-parsing. `index_meta.py` parses
+> the FSM/Swiss-Timing index.htm (stdlib only, no bs4).
 
 ## Commands
 

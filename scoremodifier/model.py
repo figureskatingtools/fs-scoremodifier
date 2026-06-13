@@ -37,10 +37,13 @@ class ResultsMeta:
     competition: str
     date: str
     venue: str
-    category: str  # pill text, e.g. "TULOKKAAT"
+    category: str  # PDF pill text, e.g. "TULOKKAAT"
     supertitle: str  # e.g. "MUODOSTELMALUISTELU · VAPAAOHJELMA"
     team_count: int = 0
     title: str = "Tulokset"
+    # Proper-case category name from the index (e.g. "Tulokkaat L1"), used for
+    # the native CAT###RS.htm caption; falls back to ``category`` when unset.
+    category_full: str = ""
 
 
 def podium_teams(teams: list[TeamResult], cutoff: int = 3) -> list[TeamResult]:

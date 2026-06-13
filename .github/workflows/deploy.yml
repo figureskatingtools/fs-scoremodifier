@@ -305,13 +305,17 @@ jobs:
 
           # Async deploy + poll: the synchronous wait regularly trips a gateway
           # 504 after ~4 minutes even though the deployment succeeds server-side.
+          # --track-status false: skip the CLI's own "wait for site to start"
+          # poll, which trips a false 10-min timeout on B1 (the site does start,
+          # just slowly). The Kudu poll loop below is the authoritative check.
           az webapp deploy \
             --resource-group "${{ needs.deploy-infra.outputs.resource_group_name }}" \
             --name "$WEBAPP_NAME" \
             --src-path frontend.zip \
             --type zip \
             --clean true \
-            --async true
+            --async true \
+            --track-status false
 
           # Poll Kudu for the new deployment's result (status 4 = success, 3 = failed)
           for i in $(seq 1 40); do

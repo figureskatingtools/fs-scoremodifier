@@ -569,6 +569,9 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
     index_url = p.get("indexUrl", "")
     pdf_file = p.get("pdfFile", "")
 
+    # Proper-case category name from the index (e.g. "Tulokkaat L1") for the
+    # native CAT###RS.htm caption; the `category` field above is the PDF badge.
+    category_full = ""
     if index_url:
         try:
             idx = parse_index_html(fetch_index_html(index_url, allowed_hosts=INDEX_ALLOWED_HOSTS))
@@ -579,6 +582,10 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
             if matched:
                 category = category or matched.name
                 cat_file = cat_file or matched.cat_file
+            # Caption name: prefer the explicitly selected CAT page, else the match.
+            selected = next((c for c in idx.categories if c.cat_file == cat_file), None) or matched
+            if selected:
+                category_full = selected.name
         except Exception as e:
             logging.warning(f"Could not use index URL {index_url}: {e}")
 
@@ -589,6 +596,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
         category=category or segment,
         supertitle=supertitle,
         team_count=len(teams),
+        category_full=category_full,
     )
 
     try:

@@ -40,6 +40,7 @@ def _cmd_results(args: argparse.Namespace) -> int:
 
     competition, date, venue, category = args.competition, args.date, args.venue, args.category
     cat_file = args.cat_file
+    category_full = ""
     if args.index_url:
         idx = parse_index_html(fetch_index_html(args.index_url))
         competition = competition or idx.competition
@@ -49,6 +50,9 @@ def _cmd_results(args: argparse.Namespace) -> int:
         if matched:
             category = category or matched.name
             cat_file = cat_file or matched.cat_file
+        selected = next((c for c in idx.categories if c.cat_file == cat_file), None) or matched
+        if selected:
+            category_full = selected.name
 
     meta = ResultsMeta(
         competition=competition or "",
@@ -57,6 +61,7 @@ def _cmd_results(args: argparse.Namespace) -> int:
         category=category or segment,
         supertitle=args.supertitle,
         team_count=len(teams),
+        category_full=category_full,
     )
 
     out = Path(args.output)
