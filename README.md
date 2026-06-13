@@ -60,7 +60,16 @@ Manual:
    - **Secrets:** `AZURE_CLIENT_ID` (OIDC deploy principal), `AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID`, `PROXY_SHARED_SECRET`
    - **Variables:** `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `LOCATION`, `RESOURCE_GROUP_NAME`, `CUSTOM_DOMAIN`
 3. Grant admin consent for the new app registration (Enterprise Applications → Permissions).
-4. The deploy workflow creates the federated identity credential (no client secret) and patches redirect URIs automatically.
+4. Grant the `fs-scoremodifier` repo **Read** access to the `@figureskatingtools/shared-ui`
+   GitHub Package (package → *Manage Actions access* → add repository), or the frontend CI build
+   fails with `403 read_package`. The CI `GITHUB_TOKEN` can't read a cross-repo org package
+   otherwise. (Mirrors `fs-judgepapers`.)
+5. The deploy workflow creates the federated identity credential (no client secret) and patches redirect URIs automatically.
+
+> **`workflow_dispatch` caveat:** GitHub only exposes manual dispatch for workflows that exist on the
+> **default branch** (`main`). Until `test` is promoted to `main`, dispatching the test deploy needs
+> `deploy.yml` present on the default branch — e.g. temporarily set the default branch to `test`,
+> dispatch, then set it back. The first push to `main` auto-deploys **prod**.
 
 The custom domain CNAME + `asuid` TXT are created by this deployment in the shared
 `figureskatingtools.com` DNS zone (`rg-fs-dns`, owned by the landing-page repo).

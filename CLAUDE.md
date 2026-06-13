@@ -137,6 +137,13 @@ environment). The workflow also patches the Entra app registration redirect URIs
 federated identity credential, and disables the Easy Auth token store. `main` is protected (PR required);
 `test` is protected from deletion.
 
+> **`workflow_dispatch` lives on the default branch.** GitHub only exposes manual dispatch for workflows
+> present on the **default branch** (`main`). The whole project currently lives on `test`; `main` is just
+> the initial commit, so `gh workflow run` 404s until `test` is promoted. Bootstrap workaround: temporarily
+> set the repo default branch to `test`, dispatch, then set it back to `main` (the dispatch trick is only
+> needed until the first `test`→`main` promotion, which is itself the first **prod** deploy). The B1 Web
+> App runs with `alwaysOn: true` (`webapp.bicep`) so zip deploys don't race the cold-start timeout.
+
 > **Entra app registrations are per-environment.** The deploy workflow's redirect-URI PATCH *replaces*
 > the app's `web.redirectUris` with the current environment's hostnames, so test and prod must use
 > **separate** app registrations (separate `AUTH_CLIENT_ID` / `AUTH_APP_OBJECT_ID` per GitHub Environment).
@@ -150,5 +157,9 @@ federated identity credential, and disables the Easy Auth token store. `main` is
    judgepapers deploy app can be reused by adding an `fs-scoremodifier` federated-credential subject),
    `AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID`, `PROXY_SHARED_SECRET`. **Variables**: `AZURE_TENANT_ID`,
    `AZURE_SUBSCRIPTION_ID`, `LOCATION`, `RESOURCE_GROUP_NAME`, `CUSTOM_DOMAIN`.
-3. Run the deploy workflow (`test` via `workflow_dispatch`); the FIC + redirect URIs are wired
+3. Grant the `fs-scoremodifier` repo **Read** access to the `@figureskatingtools/shared-ui` GitHub
+   Package (package → *Manage Actions access* → add repository). Without it the frontend CI build fails
+   with `403 read_package` — the workflow's `GITHUB_TOKEN` can't read a cross-repo org package. (Repo-
+   level, done once; not per-environment.)
+4. Run the deploy workflow (`test` via `workflow_dispatch`); the FIC + redirect URIs are wired
    automatically.
