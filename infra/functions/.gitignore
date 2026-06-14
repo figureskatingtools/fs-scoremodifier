@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.python_packages/
+local.settings.json
+scoremodifier/
