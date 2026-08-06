@@ -1,5 +1,7 @@
-azure-functions~=1.18.0
-azure-storage-blob~=12.19.0
-azure-identity~=1.25.0
-azure-data-tables~=12.5.0
-pymupdf~=1.24.0
+# azure-functions 2.x needs Python >=3.13; the Function App runs 3.11, so stay
+# on the newest 1.x until the runtime is upgraded.
+azure-functions~=1.25.0
+azure-storage-blob~=12.30.0
+azure-identity~=1.25.3
+azure-data-tables~=12.7.0
+pymupdf~=1.27.2

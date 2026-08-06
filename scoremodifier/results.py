@@ -18,6 +18,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
+from .fonts import F_BOLD, F_REG, register_fonts, text_length
 from .model import ResultsMeta, TeamResult, podium_teams, skating_order
 from .per_skater import DEFAULT_FOOTER_TEXT
 
@@ -39,9 +40,7 @@ WHITE = (1.0, 1.0, 1.0)
 _GRAD = [(0.0, (40, 180, 210)), (0.5, (18, 113, 181)), (1.0, (109, 63, 181))]
 _CARD_GRAD = [(0.0, (16, 86, 150)), (1.0, (95, 55, 165))]  # 1st-place card
 
-# fonts (PyMuPDF built-ins; brand TTFs can be embedded later without API change)
-F_BOLD = "hebo"  # Helvetica-Bold (display / headings)
-F_REG = "helv"  # Helvetica (body)
+# fonts: Raleway TTFs from assets/, embedded per page (see fonts.py)
 
 # Finnish UI strings — grouped for future i18n.
 T_TITLE = "Tulokset"
@@ -111,15 +110,15 @@ def _rounded_gradient_pixmap(
 
 
 # --- text helpers -----------------------------------------------------------
-# The built-in Helvetica only encodes Latin-1, so map common typographic glyphs
-# down and replace anything else rather than emit a .notdef box.
+# Normalize typographic glyphs the source data sometimes carries; the embedded
+# Raleway TTF handles the rest of Latin Extended natively.
 _TRANS = str.maketrans(
     {"–": "-", "—": "-", "‘": "'", "’": "'", "“": '"', "”": '"', "…": "...", " ": " "}
 )
 
 
 def _safe(s) -> str:
-    return str(s).translate(_TRANS).encode("latin-1", "replace").decode("latin-1")
+    return str(s).translate(_TRANS)
 
 
 def _text(page, point, s, **kw):
@@ -132,7 +131,7 @@ def _tbox(page, rect, s, **kw):
 
 def _fit_size(s: str, font: str, max_w: float, start: float, floor: float = 6.0) -> float:
     size = start
-    while size > floor and fitz.get_text_length(s, fontname=font, fontsize=size) > max_w:
+    while size > floor and text_length(s, fontname=font, fontsize=size) > max_w:
         size -= 0.5
     return size
 
@@ -148,6 +147,7 @@ def _draw_value(page, rect, s, font, start, floor, color):
     while size > floor:
         tmp = fitz.open()
         tp = tmp.new_page(width=_PAGE_W, height=_PAGE_H)
+        register_fonts(tp)
         rc = tp.insert_textbox(rect, s, fontname=font, fontsize=size)
         tmp.close()
         if rc >= 0:
@@ -157,9 +157,9 @@ def _draw_value(page, rect, s, font, start, floor, color):
 
 
 def _ellipsize(s: str, font: str, size: float, max_w: float) -> str:
-    if fitz.get_text_length(s, fontname=font, fontsize=size) <= max_w:
+    if text_length(s, fontname=font, fontsize=size) <= max_w:
         return s
-    while s and fitz.get_text_length(s + "...", fontname=font, fontsize=size) > max_w:
+    while s and text_length(s + "...", fontname=font, fontsize=size) > max_w:
         s = s[:-1]
     return s + "..."
 
@@ -175,7 +175,7 @@ def _center_text(page, cx, cy, s, font, size, color):
     font size tall, so place by baseline instead for medal digits / pills.
     """
     s = _safe(s)
-    w = fitz.get_text_length(s, fontname=font, fontsize=size)
+    w = text_length(s, fontname=font, fontsize=size)
     page.insert_text((cx - w / 2, cy + size * 0.35), s, fontname=font, fontsize=size, color=color)
 
 
@@ -186,7 +186,7 @@ def _label(page, x, y, s, size=7.0, color=INK_MUTED, font=F_BOLD, tracking=None)
     cx = x
     for ch in s:
         page.insert_text((cx, y), ch, fontname=font, fontsize=size, color=color)
-        cx += fitz.get_text_length(ch, fontname=font, fontsize=size) + track
+        cx += text_length(ch, fontname=font, fontsize=size) + track
     return cx - track
 
 
@@ -212,7 +212,7 @@ def _draw_header(page, meta: ResultsMeta) -> float:
     # category pill (gradient, rounded)
     if meta.category:
         cat = meta.category.upper()
-        pw = fitz.get_text_length(cat, fontname=F_BOLD, fontsize=10.5) + 30
+        pw = text_length(cat, fontname=F_BOLD, fontsize=10.5) + 30
         ph = 24.0
         py = 108.0
         pix = _rounded_gradient_pixmap(int(pw * 2), int(ph * 2), _CARD_GRAD, int(ph))
@@ -248,6 +248,7 @@ def _draw_callout(page, y: float) -> float:
     # measure wrapped height
     tmp = fitz.open()
     tp = tmp.new_page(width=_PAGE_W, height=_PAGE_H)
+    register_fonts(tp)
     used = tp.insert_textbox(
         fitz.Rect(0, 0, inner_w, 200), T_NOTE, fontname=F_REG, fontsize=8.5, color=INK_SOFT
     )
@@ -266,7 +267,7 @@ def _draw_callout(page, y: float) -> float:
 
 def _section_heading(page, y: float, title: str, suffix: str = "") -> float:
     _text(page, (_M, y), title, fontname=F_BOLD, fontsize=15, color=INK)
-    tw = fitz.get_text_length(title, fontname=F_BOLD, fontsize=15)
+    tw = text_length(title, fontname=F_BOLD, fontsize=15)
     x = _M + tw + 12
     if suffix:
         x = _label(page, x, y - 1, suffix, size=7.5, color=INK_MUTED) + 12
@@ -339,7 +340,7 @@ def _draw_others(page, teams: list[TeamResult], y: float) -> float:
         num = str(t.starting_number)
         _text(page, (x, ry + 12), num, fontname=F_BOLD, fontsize=10.5, color=RINK)
         nx = x + 26
-        club_w = fitz.get_text_length(t.club, fontname=F_REG, fontsize=9) + 4
+        club_w = text_length(t.club, fontname=F_REG, fontsize=9) + 4
         name = _ellipsize(t.name, F_BOLD, 10.5, cw - 26 - club_w - 6)
         _text(page, (nx, ry + 12), name, fontname=F_BOLD, fontsize=10.5, color=INK)
         _tbox(page, fitz.Rect(x, ry, x + cw, ry + 16), t.club,
@@ -361,6 +362,7 @@ def render_results_pdf(meta: ResultsMeta, teams: list[TeamResult]) -> bytes:
         meta.team_count = len(teams)
     doc = fitz.open()
     page = doc.new_page(width=_PAGE_W, height=_PAGE_H)
+    register_fonts(page)
 
     y = _draw_header(page, meta)
     y = _draw_info_bar(page, meta, y)
