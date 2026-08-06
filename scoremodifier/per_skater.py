@@ -22,6 +22,8 @@ import re
 
 import fitz  # PyMuPDF
 
+from .fonts import F_REG, register_fonts
+
 DEFAULT_FOOTER_TEXT = (
     "Created with Figureskatingtools.com - Supporting the Figure Skating Community."
 )
@@ -218,6 +220,7 @@ def split_per_skater(
             scratch.append(band_doc)
 
             op = out.new_page(width=W, height=H)
+            register_fonts(op)
             # repeated title, 1:1 at the original top position
             op.show_pdf_page(title_rect, header_doc, 0, clip=title_rect)
             # the team band, placed right under the title (1:1 -> identical pixels)
@@ -244,6 +247,7 @@ def split_per_skater(
                     footer_rule_y + _FOOTER_TEXT_GAP + 14.0,
                 ),
                 footer_text,
+                fontname=F_REG,
                 fontsize=_FOOTER_FONTSIZE,
                 align=fitz.TEXT_ALIGN_RIGHT,
                 color=(0, 0, 0),
