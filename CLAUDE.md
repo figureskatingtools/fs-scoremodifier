@@ -44,28 +44,24 @@ python -m scoremodifier results input.pdf -o results.pdf \
   --index-url https://www.figureskatingresults.fi/results/2526/<COMP>/index.htm --category TULOKKAAT \
   [--html-out CAT003RS.htm] [--competition … --date … --venue … --supertitle …]
 
-# Full local stack (Functions :7071 + Vite :5173 + SWA emulator :4280)
-./start_locally.sh        # sets PYTHONPATH so the function can import the core package
-
-# Frontend only (cd frontend) — needs a GitHub token with read:packages for @figureskatingtools/shared-ui
-NODE_AUTH_TOKEN=$(gh auth token) npm install   # after: gh auth refresh -s read:packages
-npm run dev               # Vite dev server
-npm run build             # tsc (strict) + vite build
-
-# Backend only (cd infra/functions) — the function imports the repo-root scoremodifier/ package
+# Backend (cd infra/functions) — the function imports the repo-root scoremodifier/ package
 python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 PYTHONPATH=$(git rev-parse --show-toplevel) func start
 
 # Deployment (manual; CI does this automatically — see Branch / Deploy Strategy)
-./deploy_infra.sh --client-id <ENTRA_CLIENT_ID> [--proxy-secret <SECRET>]
+./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>]
 ./deploy_backend.sh -g <resource-group>     # bundles the core package + pip installs, ZIP deploy
-./deploy_frontend.sh -g <resource-group>    # vite build + server.js → Web App
 ```
 
-No tests and no linter are configured; `tsc` (strict, `noUnused*`) is the only static check on the
-frontend. Local dev must go through the SWA CLI emulator (`:4280`), not Vite directly — Vite has no
-`/api` proxy. **Locally `/.auth/*` and `/userinfo` return unauthenticated**, so the UI shows the
-sign-in view; auth can only be exercised against a deployed Web App.
+> **This repo is backend-only.** The UI moved to `figureskatingtools-site`
+> (`site/src/scoremodifier/`) and is served at `figureskatingtools.com/scoremodifier/`.
+> `frontend/` + `deploy_frontend.sh` are dead weight kept until the old
+> `scoremodifier.figureskatingtools.com` Web App is torn down.
+
+No tests and no linter are configured. With the frontend gone, `az bicep build --file infra/main.bicep`
+is the only static check in this repo. To exercise the HTTP endpoints locally, run `func start` and
+curl them with the proxy headers — see `PROXY-CONTRACT.md`. UI work happens in
+`figureskatingtools-site` (`./start_locally.sh` and `frontend/` here are pre-migration leftovers).
 
 > The example FSM PDFs are **not** committed (only `README.md`/source is tracked). Drop a real
 > "Judges Details Per Skater" export next to the repo to exercise the tool.
@@ -103,36 +99,37 @@ Four pieces:
    repo root and the build (`deploy_backend.sh` + CI) copies it into the function package — single
    source of truth, no duplication. Locally, `PYTHONPATH=<repo root>` makes the import resolve.
 
-3. **Frontend** (`frontend/`) — no-framework TypeScript SPA (one view in `src/main.ts`), served in
-   production by `server.js`, a zero-dependency Node HTTP server that serves static files, exposes
-   `/userinfo`, and proxies `/api/*` to the Function App. The site banner/nav comes from
-   **`@figureskatingtools/shared-ui`** (GitHub Packages); `renderSiteNav({ activeApp: 'scoremodifier' })`
-   into `#site-nav-container`, user menu into `#fst-nav-right`. `npm install` needs a token with
-   `read:packages`. The page: instructions (Tulokkaat/Beginners), a single-PDF drop zone, an *Include
-   ranks* checkbox (unchecked by default), Generate → `POST /api/generate`, then a download link.
+3. **Frontend** — **no longer in this repo.** The UI lives in `figureskatingtools-site`
+   (`site/src/scoremodifier/` + `site/scoremodifier/index.html`) and is served at
+   `figureskatingtools.com/scoremodifier/` by that repo's single router Web App, which also owns
+   Easy Auth, `/userinfo` and the `/scoremodifier/api/*` → Function App proxy. The local `frontend/`
+   directory is the pre-migration copy, no longer built or deployed; it is kept only until the old
+   `scoremodifier.figureskatingtools.com` Web App is torn down (see `frontend/README.md`).
 
-4. **Infra** (`infra/main.bicep` + `modules/`) — subscription-scoped Bicep mirroring judgepapers:
+4. **Infra** (`infra/main.bicep` + `modules/`) — subscription-scoped Bicep, **backend-only**:
    resource group, **own storage account** (`stfsscore…`, container `fs-scoremodifier`, tables
    `competitions` + `generatedpapers`, plus the `app-package` deploy container — no `categories`
-   table), Flex Consumption Function App, B1 Web App, user-assigned managed identity for Easy Auth
-   (federated credential, no client secret), RBAC (Blob Data Contributor + Table Data Contributor +
-   Blob Delegator), and DNS + custom-domain binding (`scoremodifier.figureskatingtools.com` prod,
-   `test.scoremodifier.figureskatingtools.com` test) in the shared `figureskatingtools.com` zone
-   (`rg-fs-dns`, owned by the landing-page repo). Per-env params in `infra/parameters/{test,prod}.bicepparam`;
-   CI also passes `resourceGroupName`/`customDomain` inline from GitHub environment variables.
+   table), Flex Consumption Function App (system-assigned identity, CORS empty), App Insights, and
+   RBAC (Blob Data Contributor + Table Data Contributor + Blob Delegator). No Web App, no auth
+   managed identity, no DNS and no custom domain — those moved to the site repo. `main.bicep` exports
+   `functionAppName` + `functionPrincipalId`, which the site repo consumes as its
+   `FUNCTION_APP_URL_SCOREMODIFIER` / `TOOL_PRINCIPAL_ID_SCOREMODIFIER` environment values. Per-env
+   params in `infra/parameters/{test,prod}.bicepparam`; CI passes `resourceGroupName` and
+   `proxySharedSecret` inline from the GitHub environment.
 
-### Auth chain (identical to judgepapers — important when touching any endpoint)
+### Auth chain (important when touching any endpoint) — see `PROXY-CONTRACT.md`
 
-All function routes are `AuthLevel.ANONYMOUS`; real auth is Entra ID Easy Auth on the Web App. Easy
-Auth injects `X-MS-CLIENT-PRINCIPAL*` → `server.js` forwards the email as `X-Forwarded-User-Email` to
-the Function App → `get_user_email_from_header()` resolves it (direct header → forwarded header → base64
-principal → Bearer JWT). Every endpoint calls it and returns 401 on `None`. **The Function App itself
-must be `AllowAnonymous`** (`function.bicep` `globalValidation`), not `requireAuthentication`, or Easy
-Auth would 401 the proxied requests (which carry only the email header, no bearer token). Because the
-function is public, a **shared secret** stops spoofing: the Web App holds `PROXY_SHARED_SECRET`,
-`server.js` sends it as `X-Proxy-Secret`, and `_proxy_secret_ok()` rejects mismatches. Enforced only
-when the env var is set (local/dev fail open). `is_user_allowed()` allows all authenticated users (hook
-for a future allowlist).
+All function routes are `AuthLevel.ANONYMOUS`; real auth is Entra ID Easy Auth on the **router Web App
+in the site repo**. Easy Auth injects `X-MS-CLIENT-PRINCIPAL*` there → the router forwards the email as
+`X-Forwarded-User-Email` to this Function App → `get_user_email_from_header()` resolves it (direct
+header → forwarded header → base64 principal → Bearer JWT). Every endpoint calls it and returns 401 on
+`None`. **The Function App itself must be `AllowAnonymous`** (`function.bicep` `globalValidation`), not
+`requireAuthentication`, or Easy Auth would 401 the proxied requests (which carry only the email header,
+no bearer token); no identity provider is configured on it at all any more. Because the function is
+public, a **shared secret** stops spoofing: the router holds `PROXY_SHARED_SECRET_SCOREMODIFIER` and
+sends it as `X-Proxy-Secret`, and `_proxy_secret_ok()` rejects mismatches against this app's
+`PROXY_SHARED_SECRET`. Enforced only when the env var is set (local/dev fail open). `is_user_allowed()`
+allows all authenticated users (hook for a future allowlist).
 
 ### Storage layout & data model
 
@@ -148,46 +145,43 @@ user-delegation key), connection string via `AzureWebJobsStorage` otherwise (loc
 
 ## Site integration
 
-The tool is registered in `figureskatingtools-site`: `DEFAULT_TOOLS` in
-`packages/shared-ui/src/nav.ts` (`id/subdomain: 'scoremodifier'`, `enabled: true`), the shared-ui
-package version bumped to **2.2.0**, and the repo added to `site/public/changelog-sources.json`
-(`tool: "Score Modifier"`) with a `.changelog-badge--score-modifier` rule in `site/src/style.css`. The
-frontend depends on shared-ui `^2.1.0`, which resolves to 2.2.0 once that version is republished from
-the site repo. **Order matters:** republish shared-ui 2.2.0 + redeploy the site before/with the
-scoremodifier frontend deploy so the live nav links to the tool and the build bundles `enabled: true`.
+`figureskatingtools-site` owns everything user-facing: the tool's UI (`site/src/scoremodifier/`), its
+nav entry (`DEFAULT_TOOLS` in `packages/shared-ui/src/nav.ts`, path `/scoremodifier/`), and the
+changelog feed entry in `site/public/changelog-sources.json` (`tool: "Score Modifier"`, with a
+`.changelog-badge--score-modifier` rule in `site/src/style.css`).
+
+This repo only has to hand two values to the site repo's GitHub environments after an infra deploy
+(both are printed in the workflow's job summary): `FUNCTION_APP_URL_SCOREMODIFIER` (from
+`functionAppName`) and `TOOL_PRINCIPAL_ID_SCOREMODIFIER` (from `functionPrincipalId`). The
+`PROXY_SHARED_SECRET` value must match the site repo's `PROXY_SHARED_SECRET_SCOREMODIFIER` for the
+same environment.
 
 ## Branch / Deploy Strategy
 
-`test` → `main` promote via PRs (squash). `.github/workflows/deploy.yml` deploys infra (Bicep), backend,
-and frontend to the matching GitHub environment: **push to `main` auto-deploys prod**; **`test` is
-manual-only** via `workflow_dispatch` (run the workflow from the branch whose code you want, pick the
-environment). The workflow also patches the Entra app registration redirect URIs and creates the
-federated identity credential, and disables the Easy Auth token store. `main` is protected (PR required);
-`test` is protected from deletion.
+`test` → `main` promote via PRs (squash). `.github/workflows/deploy.yml` deploys **infra (Bicep) then
+backend (Functions)** to the matching GitHub environment: **push to `main` auto-deploys prod**;
+**`test` is manual-only** via `workflow_dispatch` (run the workflow from the branch whose code you
+want, pick the environment). There is no frontend job any more — the UI ships from
+`figureskatingtools-site`. `main` is protected (PR required); `test` is protected from deletion.
 
 > **`workflow_dispatch` lives on the default branch.** GitHub only exposes manual dispatch for workflows
 > present on the **default branch** (`main`). The whole project currently lives on `test`; `main` is just
 > the initial commit, so `gh workflow run` 404s until `test` is promoted. Bootstrap workaround: temporarily
 > set the repo default branch to `test`, dispatch, then set it back to `main` (the dispatch trick is only
-> needed until the first `test`→`main` promotion, which is itself the first **prod** deploy). The B1 Web
-> App runs with `alwaysOn: true` (`webapp.bicep`) so zip deploys don't race the cold-start timeout.
+> needed until the first `test`→`main` promotion, which is itself the first **prod** deploy).
 
-> **Entra app registrations are per-environment.** The deploy workflow's redirect-URI PATCH *replaces*
-> the app's `web.redirectUris` with the current environment's hostnames, so test and prod must use
-> **separate** app registrations (separate `AUTH_CLIENT_ID` / `AUTH_APP_OBJECT_ID` per GitHub Environment).
+> **No Entra config lives here any more.** Redirect URIs, the federated identity credential and the
+> auth app registration all belong to the router Web App in `figureskatingtools-site`.
+> `create_auth_app.sh` is a leftover from the standalone era and is not used.
 
 ### One-time setup (per environment)
 
-1. `./create_auth_app.sh "<AppName>" <hostname>` → creates a dedicated Entra app registration (ID
-   tokens, v2 access tokens, User.Read, service principal; no client secret — Easy Auth uses a federated
-   credential created by CI). Note the Client ID + Object ID; grant admin consent in the portal.
-2. GitHub Environment (`test` / `prod`) **secrets**: `AZURE_CLIENT_ID` (OIDC deploy principal — the
+1. GitHub Environment (`test` / `prod`) **secrets**: `AZURE_CLIENT_ID` (OIDC deploy principal — the
    judgepapers deploy app can be reused by adding an `fs-scoremodifier` federated-credential subject),
-   `AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID`, `PROXY_SHARED_SECRET`. **Variables**: `AZURE_TENANT_ID`,
-   `AZURE_SUBSCRIPTION_ID`, `LOCATION`, `RESOURCE_GROUP_NAME`, `CUSTOM_DOMAIN`.
-3. Grant the `fs-scoremodifier` repo **Read** access to the `@figureskatingtools/shared-ui` GitHub
-   Package (package → *Manage Actions access* → add repository). Without it the frontend CI build fails
-   with `403 read_package` — the workflow's `GITHUB_TOKEN` can't read a cross-repo org package. (Repo-
-   level, done once; not per-environment.)
-4. Run the deploy workflow (`test` via `workflow_dispatch`); the FIC + redirect URIs are wired
-   automatically.
+   `PROXY_SHARED_SECRET`. **Variables**: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `LOCATION`,
+   `RESOURCE_GROUP_NAME`. (`AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID` and `CUSTOM_DOMAIN` are obsolete —
+   delete them once the old Web App is gone.)
+2. Run the deploy workflow (`test` via `workflow_dispatch`).
+3. Copy the job summary's `functionAppName` / `functionPrincipalId` into the `figureskatingtools-site`
+   repo's matching environment as `FUNCTION_APP_URL_SCOREMODIFIER` / `TOOL_PRINCIPAL_ID_SCOREMODIFIER`,
+   and mirror `PROXY_SHARED_SECRET` there as `PROXY_SHARED_SECRET_SCOREMODIFIER`.
