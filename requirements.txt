@@ -1,1 +1,5 @@
-pymupdf~=1.27.2
+# The CLI runs the same scoremodifier/ package the Function App does, so this pin
+# must stay in step with infra/functions/requirements.txt. A split here lets local
+# output drift from the deployed backend's — PyMuPDF is what measures and draws
+# every generated page, so a mismatch is a silent rendering difference, not a nit.
+pymupdf~=1.28.2
