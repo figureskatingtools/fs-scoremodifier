@@ -48,7 +48,7 @@ jobs:
       resource_group_name: ${{ steps.deploy.outputs.resourceGroupName }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Azure Login (OIDC)
         uses: azure/login@v3
@@ -99,10 +99,10 @@ jobs:
     environment: ${{ needs.set-environment.outputs.env_name }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
