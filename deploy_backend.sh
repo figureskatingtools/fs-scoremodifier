@@ -39,10 +39,20 @@ rm -f test_*.py
 rm -rf tests requirements-dev.txt pytest.ini
 find . -type d -name __pycache__ -prune -exec rm -rf {} +
 
-# Install dependencies specifically for Flex Consumption
-echo "Installing dependencies to .python_packages..."
+# Install dependencies specifically for Flex Consumption. The Function App runs
+# Python 3.13 (infra/modules/function.bicep), so resolve the packages with a
+# 3.13 interpreter: azure-functions 2.x refuses to install on anything older,
+# and a mismatched interpreter would silently pick different wheels than the
+# host loads. PYTHON=<path> overrides the lookup.
+PYTHON="${PYTHON:-$(command -v python3.13 || command -v python3 || command -v python || true)}"
+if [ -z "$PYTHON" ] || ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 13) else 1)' 2>/dev/null; then
+    echo "Error: Python 3.13 is required to build the package (found: ${PYTHON:-none} $("$PYTHON" --version 2>&1 || true))."
+    echo "Install 3.13 (e.g. 'uv python install 3.13') or set PYTHON=/path/to/python3.13."
+    exit 1
+fi
+echo "Installing dependencies to .python_packages with $PYTHON ($("$PYTHON" --version))..."
 mkdir -p .python_packages/lib/site-packages
-pip install -r requirements.txt --target .python_packages/lib/site-packages
+"$PYTHON" -m pip install -r requirements.txt --target .python_packages/lib/site-packages
 
 # Create zip file
 echo "Creating backend.zip..."

@@ -109,13 +109,29 @@ def test_matches_golden_output_from_deployed_backend(sample):
     )
 
 
-def test_results_golden_has_every_team(sample):
+def test_results_matches_golden_output_from_deployed_backend(sample):
+    """Render the results page now and compare it with what the deployed backend
+    stored. The competition name/date/venue the operator entered are not kept
+    with the sample, so the comparison covers everything the extraction drives:
+    page geometry and the ordered sequence of team names, clubs and scores."""
     golden = sample / "output" / "results.pdf"
     if not golden.is_file():
         pytest.skip("no results golden for this sample")
-    teams, _ = extract_results((sample / "source.pdf").read_bytes())
+    teams, segment = extract_results((sample / "source.pdf").read_bytes())
     gold = golden.read_bytes()
-    text = "\n".join(page_texts(gold))
-    assert page_sizes(gold) == [(595, 842)]
-    for t in teams:
-        assert t.name in text
+    now = render_results_pdf(
+        ResultsMeta(competition="", date="", venue="", category=segment, supertitle="", team_count=len(teams)),
+        teams,
+    )
+    assert page_sizes(now) == page_sizes(gold) == [(595, 842)]
+
+    tokens = {t.name for t in teams} | {t.club for t in teams} | {f"{t.segment_score:.2f}" for t in teams}
+
+    def team_lines(pdf):
+        return [ln for ln in stable_lines("\n".join(page_texts(pdf))) if ln in tokens]
+
+    gold_lines, now_lines = team_lines(gold), team_lines(now)
+    assert gold_lines, "golden page holds no team data?"
+    assert now_lines == gold_lines
+    # Podium carries scores, the rest does not: exactly one score line per podium entry.
+    assert sum(1 for ln in now_lines if ln.replace(".", "").isdigit()) == len(podium_teams(teams))
