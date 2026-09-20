@@ -18,7 +18,7 @@ results service emits verbatim.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 
 from .model import ResultsMeta, TeamResult, podium_teams
@@ -35,7 +35,7 @@ def _last_update() -> str:
         off = f"{off[:3]}:{off[3:]}" if len(off) == 5 else off
         return f"{now.strftime('%d.%m.%Y %H:%M')} (UTC {off})"
     except Exception:
-        return f"{datetime.utcnow().strftime('%d.%m.%Y %H:%M')} (UTC)"
+        return f"{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} (UTC)"
 
 
 def _row(t: TeamResult, idx: int) -> str:
@@ -61,7 +61,7 @@ def render_results_html(meta: ResultsMeta, teams: list[TeamResult]) -> str:
     cat = meta.category_full or meta.category  # proper-case name for the caption
     category = escape(cat or meta.title or "")
     title = escape(" - ".join(p for p in (meta.competition, cat) if p) or "Result")
-    year = datetime.utcnow().year
+    year = datetime.now(timezone.utc).year
     return f"""<html>
 <head>
     <title>{title}</title>

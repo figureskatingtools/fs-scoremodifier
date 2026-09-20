@@ -73,6 +73,14 @@ LEGACY_DELETION_DATE = "2026-06-12T00:00:00Z"
 AUTO_CLEANUP_ACTOR = "auto-cleanup"
 
 
+def _utcnow() -> datetime:
+    """Naive UTC "now". Every timestamp this app stores is serialised as a naive
+    ISO string plus a literal Z (and the SAS start/expiry are naive too), so an
+    aware datetime would change the stored format. datetime.utcnow() is
+    deprecated since 3.12; this keeps the exact same value and shape."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def is_user_allowed(email: str) -> bool:
     """
     Check if the user is allowed to perform sensitive operations.
@@ -296,7 +304,7 @@ def create_and_store_sas_link(blob_service_client, container_name, blob_name, co
         except Exception:
             pass
 
-        start_time = datetime.utcnow()
+        start_time = _utcnow()
         expiry = start_time + timedelta(days=5)
         sas_token = ""
 
@@ -452,7 +460,7 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
         out_blob = f"{folder}/output/{OUTPUT_FILENAME}"
         container.upload_blob(out_blob, output_bytes, overwrite=True)
 
-        now = datetime.utcnow()
+        now = _utcnow()
         comp_table.create_entity({
             "PartitionKey": "GLOBAL",
             "RowKey": new_id,
@@ -644,7 +652,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
         container.upload_blob(pdf_blob, results_pdf, overwrite=True)
         container.upload_blob(html_blob, results_html, overwrite=True)
 
-        now = datetime.utcnow()
+        now = _utcnow()
         comp_table.create_entity({
             "PartitionKey": "GLOBAL",
             "RowKey": new_id,
@@ -798,7 +806,7 @@ def _delete_competition_data(entity, deleted_by):
         "PartitionKey": "GLOBAL",
         "RowKey": comp_id,
         "Visible": False,
-        "DeletedDate": f"{datetime.utcnow().isoformat()}Z",
+        "DeletedDate": f"{_utcnow().isoformat()}Z",
         "DeletedBy": deleted_by,
     }, mode=UpdateMode.MERGE)
 

@@ -35,6 +35,8 @@ cd "$BUILD_DIR"
 # Cleanup - remove dev/test files and artifacts
 rm -rf .venv __pycache__ .git .vscode *.pyc local.settings.json
 rm -f test_*.py
+# The pytest suite and its dev requirements never ship in the package.
+rm -rf tests requirements-dev.txt pytest.ini
 find . -type d -name __pycache__ -prune -exec rm -rf {} +
 
 # Install dependencies specifically for Flex Consumption
