@@ -35,8 +35,10 @@ the index.htm URL → auto-fill, Generate → PDF + HTML).
 ## Commands
 
 ```bash
-# Core PDF logic as a standalone CLI (the canonical implementation)
-python -m venv .venv && source .venv/bin/activate
+# Core PDF logic as a standalone CLI (the canonical implementation). Use Python 3.13 —
+# the Function App's runtime — so local output matches the backend (uv fetches it:
+# `uv venv --python 3.13 .venv`).
+python3.13 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m scoremodifier per-skater input.pdf -o out.pdf [--hide-non-podium-ranks]
 # Results summary PDF + podium-only CAT###RS.htm (name/date/venue + CAT file from the index URL)
@@ -44,13 +46,16 @@ python -m scoremodifier results input.pdf -o results.pdf \
   --index-url https://www.figureskatingresults.fi/results/2526/<COMP>/index.htm --category TULOKKAAT \
   [--html-out CAT003RS.htm] [--competition … --date … --venue … --supertitle …]
 
-# Backend (cd infra/functions) — the function imports the repo-root scoremodifier/ package
-python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
-PYTHONPATH=$(git rev-parse --show-toplevel) func start
+# Backend (cd infra/functions) — the function imports the repo-root scoremodifier/ package.
+# Python 3.13 only: azure-functions 2.x does not install on older interpreters. The 3.13
+# proxy worker rebuilds sys.path and ignores PYTHONPATH, so copy (or symlink) the package
+# next to function_app.py for a local host.
+python3.13 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+ln -s ../../scoremodifier scoremodifier && func start   # the symlink is gitignored
 
 # Deployment (manual; CI does this automatically — see Branch / Deploy Strategy)
 ./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>]
-./deploy_backend.sh -g <resource-group>     # bundles the core package + pip installs, ZIP deploy
+./deploy_backend.sh -g <resource-group>     # bundles the core package + pip installs (needs python3.13 or PYTHON=…), ZIP deploy
 ```
 
 > **This repo is backend-only.** The UI moved to `figureskatingtools-site`
@@ -58,9 +63,27 @@ PYTHONPATH=$(git rev-parse --show-toplevel) func start
 > `frontend/` + `deploy_frontend.sh` are dead weight kept until the old
 > `scoremodifier.figureskatingtools.com` Web App is torn down.
 
-No tests and no linter are configured. With the frontend gone, `az bicep build --file infra/main.bicep`
-is the only static check in this repo. To exercise the HTTP endpoints locally, run `func start` and
-curl them with the proxy headers — see `PROXY-CONTRACT.md`. UI work happens in
+## Tests
+
+```bash
+# pytest suite for the backend handlers + the core package (uv fetches the interpreter)
+cd infra/functions && PYTHONPATH=$(git rev-parse --show-toplevel) \
+  uv run --python 3.13 --with-requirements requirements-dev.txt python -m pytest tests -q
+```
+
+`infra/functions/tests/` runs the real `function_app` handlers against dict-backed blob/table
+fakes (`conftest.py`), the SAS path with a dummy account key, the proxy auth contract, the
+auto-delete sweep, and the `scoremodifier` package on real FSM exports. Sample exports are **not
+committed** (skaters' names): the suite reads `SCOREMODIFIER_SAMPLE_DIR` (default
+`../fs-samples/scoremodifier`, one directory per competition holding `source.pdf` and optionally
+`output/per-skater.pdf` / `output/results.pdf` as goldens — exactly the tool's own storage layout,
+so `az storage blob download-batch` from the test account produces it) and skips those tests when
+it is missing. Singles-category exports split fine but have no parseable team row, so the
+results-tool tests skip them (known limitation, not a bug). `pytest.ini` turns
+`DeprecationWarning` into errors for our own code. No linter is configured;
+`az bicep build --file infra/main.bicep` is the only other static check. The deploy bundle strips
+`tests/`, `requirements-dev.txt` and `pytest.ini`. To exercise the HTTP endpoints against a real host, run
+`func start` and curl them with the proxy headers — see `PROXY-CONTRACT.md`. UI work happens in
 `figureskatingtools-site` (`./start_locally.sh` and `frontend/` here are pre-migration leftovers).
 
 > The example FSM PDFs are **not** committed (only `README.md`/source is tracked). Drop a real
@@ -81,7 +104,8 @@ Four pieces:
    from FSM exports (PDFsharp; CID font with a +0x1D glyph offset; each team's 3-line column header has
    the `Rank` word on its middle line, so block tops are found `~7pt` above the `Rank` anchor).
 
-2. **Backend** (`infra/functions/`) — Python Azure Functions (Flex Consumption, Python 3.11), HTTP-
+2. **Backend** (`infra/functions/`) — Python Azure Functions (Flex Consumption, Python 3.13,
+   `azure-functions` 2.x — the 2.x line is 3.13+ only and API-identical to 1.x), HTTP-
    triggered, in `function_app.py`. **`generate`** (POST, body = the PDF,
    `?includeRanks=true|false`, default `false` ⇒ `hide_non_podium_ranks=True`): runs
    `split_per_skater`, derives a name from the PDF (`<segment> — <printed date>`, page-0 text), stores
@@ -158,11 +182,17 @@ same environment.
 
 ## Branch / Deploy Strategy
 
-`test` → `main` promote via PRs (squash). `.github/workflows/deploy.yml` deploys **infra (Bicep) then
-backend (Functions)** to the matching GitHub environment: **push to `main` auto-deploys prod**;
+`test` → `main` promote via PRs (squash). `.github/workflows/deploy.yml` runs the **pytest suite
+first** (the `test` job; both deploy jobs depend on it, so a red suite blocks the deploy), then
+deploys **infra (Bicep) then backend (Functions)** to the matching GitHub environment:
+**push to `main` auto-deploys prod**;
 **`test` is manual-only** via `workflow_dispatch` (run the workflow from the branch whose code you
 want, pick the environment). There is no frontend job any more — the UI ships from
 `figureskatingtools-site`. `main` is protected (PR required); `test` is protected from deletion.
+The runner image is pinned (`runs-on: ubuntu-26.04`, never `ubuntu-latest`) — see the header
+comment in the workflow; bump every job together and dispatch to test first. Dependabot
+(`.github/dependabot.yml`, read from `main` only) watches `infra/functions` pip and GitHub Actions,
+grouped weekly, targeting `test`; the dead `frontend/` is not watched.
 
 > **`workflow_dispatch` lives on the default branch.** GitHub only exposes manual dispatch for workflows
 > present on the **default branch** (`main`). The whole project currently lives on `test`; `main` is just

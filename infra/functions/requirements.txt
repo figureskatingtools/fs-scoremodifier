@@ -1,7 +1,11 @@
-# azure-functions 2.x needs Python >=3.13; the Function App runs 3.11, so stay
-# on the newest 1.x until the runtime is upgraded.
-azure-functions~=1.25.0
-azure-storage-blob~=12.30.1
+# The Function App runs Python 3.13 (infra/modules/function.bicep + the deploy
+# workflow's setup-python), so azure-functions stays on the 2.x line: 2.x is
+# built for >=3.13 and is API-identical to 1.x. Do not drop back to 1.x — that
+# line is for 3.10–3.12 hosts only.
+azure-functions~=2.3.0
+azure-storage-blob~=12.30.2
 azure-identity~=1.25.3
 azure-data-tables~=12.7.0
+# Must stay in step with the repo-root requirements.txt (the CLI renders with
+# the same package; a split pin is a silent rendering difference).
 pymupdf~=1.28.2

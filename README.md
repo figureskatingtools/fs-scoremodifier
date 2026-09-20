@@ -37,7 +37,8 @@ requests without the secret — the full contract is in [PROXY-CONTRACT.md](PROX
 ## Core tool (standalone / CLI)
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+# Python 3.13 — the Function App's runtime — so local output matches the backend
+python3.13 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m scoremodifier per-skater input.pdf -o out.pdf [--hide-non-podium-ranks]
 ```
@@ -78,8 +79,11 @@ to `figureskatingtools-site` with the frontend.
 
 ```bash
 cd infra/functions
-python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
-PYTHONPATH=$(git rev-parse --show-toplevel) func start   # :7071
+python3.13 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt   # 3.13 only (azure-functions 2.x)
+ln -s ../../scoremodifier scoremodifier   # gitignored; the 3.13 worker ignores PYTHONPATH
+func start                                # :7071
+# tests
+pip install -r requirements-dev.txt && PYTHONPATH=$(git rev-parse --show-toplevel) python -m pytest tests -q
 ```
 
 Requires an Azurite/real storage connection in `infra/functions/local.settings.json`. Call the
