@@ -1,0 +1,10 @@
+# Test dependencies: the runtime requirements (the tests import the real
+# function_app module, which pulls in azure.functions, the storage SDKs and
+# PyMuPDF) plus pytest. Never bundled — deploy_backend.sh and the workflow
+# strip this file and tests/ from the package.
+#
+#   cd infra/functions
+#   PYTHONPATH=$(git rev-parse --show-toplevel) \
+#     uv run --python 3.13 --with-requirements requirements-dev.txt python -m pytest tests -q
+-r requirements.txt
+pytest~=8.3
