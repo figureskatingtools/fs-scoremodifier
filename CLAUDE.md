@@ -182,17 +182,26 @@ same environment.
 
 ## Branch / Deploy Strategy
 
-`test` → `main` promote via PRs (squash). `.github/workflows/deploy.yml` runs the **pytest suite
+**Flow (no long-lived `test` branch):** branch from `main` → dispatch `deploy.yml` on that
+branch with `environment=test` → PR to `main` → merge (squash) → push to `main` deploys prod →
+the branch is auto-deleted on merge. `main` is guarded by a ruleset: PR required, code-owner
+review (`.github/CODEOWNERS`: `* @mmaraa`), squash only, the `pytest` check
+(`.github/workflows/ci.yml`, every PR) must pass, no force-push/deletion; repository admins can
+bypass, which is how the owner merges their own PRs. The `prod` GitHub environment only accepts
+deployments from `main`; `test` accepts any branch and holds whichever was deployed last.
+
+`.github/workflows/deploy.yml` runs the **pytest suite
 first** (the `test` job; both deploy jobs depend on it, so a red suite blocks the deploy), then
 deploys **infra (Bicep) then backend (Functions)** to the matching GitHub environment:
 **push to `main` auto-deploys prod**;
 **`test` is manual-only** via `workflow_dispatch` (run the workflow from the branch whose code you
 want, pick the environment). There is no frontend job any more — the UI ships from
-`figureskatingtools-site`. `main` is protected (PR required); `test` is protected from deletion.
+`figureskatingtools-site`.
 The runner image is pinned (`runs-on: ubuntu-26.04`, never `ubuntu-latest`) — see the header
 comment in the workflow; bump every job together and dispatch to test first. Dependabot
 (`.github/dependabot.yml`, read from `main` only) watches `infra/functions` pip and GitHub Actions,
-grouped weekly, targeting `test`; the dead `frontend/` is not watched.
+grouped weekly, with PRs against `main` like any feature branch; the dead `frontend/` is not
+watched.
 
 > **`workflow_dispatch` lives on the default branch.** GitHub only exposes manual dispatch for workflows
 > present on the **default branch** (`main`). The whole project currently lives on `test`; `main` is just

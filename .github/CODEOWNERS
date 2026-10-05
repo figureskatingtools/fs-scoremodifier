@@ -1,0 +1,4 @@
+# Every change needs the owner's review. The `main` ruleset requires code-owner
+# approval, so pull requests from anyone else (Dependabot included) wait for
+# @mmaraa; the owner's own PRs merge through the admin bypass.
+* @mmaraa

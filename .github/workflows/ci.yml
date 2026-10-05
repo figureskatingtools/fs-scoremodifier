@@ -1,0 +1,41 @@
+name: CI
+
+# The backend suite on every pull request, so a red suite blocks the merge instead
+# of surfacing as a failed prod deploy (deploy.yml's `test` job runs it again).
+# The `pytest` job name is the required status check in the `main` ruleset —
+# rename it there too if it changes. Runner pinned like deploy.yml; never
+# ubuntu-latest.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: infra/functions/requirements*.txt
+
+      - name: Install test dependencies
+        working-directory: infra/functions
+        run: pip install -r requirements-dev.txt
+
+      # Sample FSM exports are not committed (skaters' names), so the
+      # sample-based tests skip here, exactly as in deploy.yml.
+      - name: Run pytest
+        working-directory: infra/functions
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests -q -rs
