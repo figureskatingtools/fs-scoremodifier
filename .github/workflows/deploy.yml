@@ -9,8 +9,11 @@ name: Deploy to Azure
 # back to ubuntu-latest. Rollback label: ubuntu-24.04.
 
 on:
-  # Push to main auto-deploys prod. test is deployed only via manual dispatch
-  # (run the workflow from the branch whose code you want to deploy).
+  # Flow: feature branch -> manual dispatch to `test` -> PR to main (CI green,
+  # code-owner review) -> merge -> push to main auto-deploys prod. Dispatch runs
+  # from the branch whose code you want to deploy; the `prod` GitHub environment
+  # only accepts `main` (deployment branch policy), so the prod option is for
+  # redeploying main.
   push:
     branches: [main]
   workflow_dispatch:
