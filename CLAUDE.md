@@ -60,8 +60,8 @@ ln -s ../../scoremodifier scoremodifier && func start   # the symlink is gitigno
 
 > **This repo is backend-only.** The UI moved to `figureskatingtools-site`
 > (`site/src/scoremodifier/`) and is served at `figureskatingtools.com/scoremodifier/`.
-> `frontend/` + `deploy_frontend.sh` are dead weight kept until the old
-> `scoremodifier.figureskatingtools.com` Web App is torn down.
+> The pre-migration `frontend/`, `deploy_frontend.sh` and `start_locally.sh` were removed once
+> the old `scoremodifier.figureskatingtools.com` Web App was torn down.
 
 ## Tests
 
@@ -84,7 +84,7 @@ results-tool tests skip them (known limitation, not a bug). `pytest.ini` turns
 `az bicep build --file infra/main.bicep` is the only other static check. The deploy bundle strips
 `tests/`, `requirements-dev.txt` and `pytest.ini`. To exercise the HTTP endpoints against a real host, run
 `func start` and curl them with the proxy headers — see `PROXY-CONTRACT.md`. UI work happens in
-`figureskatingtools-site` (`./start_locally.sh` and `frontend/` here are pre-migration leftovers).
+`figureskatingtools-site` (run its router + Vite dev server pointed at this `func start` instance).
 
 > The example FSM PDFs are **not** committed (only `README.md`/source is tracked). Drop a real
 > "Judges Details Per Skater" export next to the repo to exercise the tool.
@@ -126,9 +126,7 @@ Four pieces:
 3. **Frontend** — **no longer in this repo.** The UI lives in `figureskatingtools-site`
    (`site/src/scoremodifier/` + `site/scoremodifier/index.html`) and is served at
    `figureskatingtools.com/scoremodifier/` by that repo's single router Web App, which also owns
-   Easy Auth, `/userinfo` and the `/scoremodifier/api/*` → Function App proxy. The local `frontend/`
-   directory is the pre-migration copy, no longer built or deployed; it is kept only until the old
-   `scoremodifier.figureskatingtools.com` Web App is torn down (see `frontend/README.md`).
+   Easy Auth, `/userinfo` and the `/scoremodifier/api/*` → Function App proxy.
 
 4. **Infra** (`infra/main.bicep` + `modules/`) — subscription-scoped Bicep, **backend-only**:
    resource group, **own storage account** (`stfsscore…`, container `fs-scoremodifier`, tables
@@ -200,8 +198,7 @@ want, pick the environment). There is no frontend job any more — the UI ships 
 The runner image is pinned (`runs-on: ubuntu-26.04`, never `ubuntu-latest`) — see the header
 comment in the workflow; bump every job together and dispatch to test first. Dependabot
 (`.github/dependabot.yml`, read from `main` only) watches `infra/functions` pip and GitHub Actions,
-grouped weekly, with PRs against `main` like any feature branch; the dead `frontend/` is not
-watched.
+grouped weekly, with PRs against `main` like any feature branch.
 
 > **`workflow_dispatch` lives on the default branch.** GitHub only exposes manual dispatch for workflows
 > present on the **default branch** (`main`). The whole project currently lives on `test`; `main` is just
