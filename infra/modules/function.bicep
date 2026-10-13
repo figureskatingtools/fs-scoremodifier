@@ -37,8 +37,6 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   kind: 'web'
   properties: {
     Application_Type: 'web'
-    // Telemetry can carry request details; keep it no longer than needed.
-    RetentionInDays: 30
   }
 }
 
