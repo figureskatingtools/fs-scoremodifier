@@ -41,13 +41,15 @@ os.environ["AzureWebJobsStorage"] = (
 )
 os.environ.pop("AzureWebJobsStorage__accountName", None)
 os.environ.pop("PROXY_SHARED_SECRET", None)
+os.environ.pop("PLATFORM_STORAGE_ACCOUNT", None)
 
 import fitz  # noqa: E402
 import pytest  # noqa: E402
 import azure.functions as func  # noqa: E402
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError  # noqa: E402
+from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError  # noqa: E402
 
 import function_app as fa  # noqa: E402
+import platform_clock  # noqa: E402
 
 TEST_EMAIL = "tester@example.com"
 
@@ -166,7 +168,50 @@ def storage(monkeypatch) -> FakeStorage:
     monkeypatch.setattr(fa, "get_blob_service_client", lambda: st.blob_service)
     monkeypatch.setattr(fa, "get_table_client", lambda table_name="generatedpapers": st.table(table_name))
     monkeypatch.delenv("PROXY_SHARED_SECRET", raising=False)
+    # Platform clock off unless a test opts in with the `platform` fixture.
+    monkeypatch.delenv("PLATFORM_STORAGE_ACCOUNT", raising=False)
     return st
+
+
+class _UnreachableTableClient:
+    """A platform table whose every read fails (network, RBAC, throttling)."""
+
+    def __init__(self):
+        self.reads = 0
+
+    def get_entity(self, partition_key, row_key):
+        self.reads += 1
+        raise HttpResponseError("platform registry unreachable")
+
+
+class FakePlatform:
+    """The site's platform ``competitions`` table (PK "COMPETITION", RK guid)."""
+
+    def __init__(self):
+        self.rows: dict = {}
+        self.unreachable = False
+        self.reads = 0
+        self._broken = _UnreachableTableClient()
+
+    def add(self, guid, *, deletion, status="active", purged=None):
+        row = {"PartitionKey": "COMPETITION", "RowKey": guid.lower(), "Status": status, "DeletionDate": deletion}
+        if purged:
+            row["PurgedUtc"] = purged
+        self.rows[("COMPETITION", guid.lower())] = row
+        return row
+
+    def client(self):
+        self.reads += 1
+        return self._broken if self.unreachable else FakeTableClient(self.rows)
+
+
+@pytest.fixture
+def platform(monkeypatch) -> FakePlatform:
+    """Turn the platform clock on, backed by an in-memory registry."""
+    pf = FakePlatform()
+    monkeypatch.setenv("PLATFORM_STORAGE_ACCOUNT", "stfsplattest")
+    monkeypatch.setattr(platform_clock, "get_platform_table_client", pf.client)
+    return pf
 
 
 # ── requests ──────────────────────────────────────────────────────────────────
