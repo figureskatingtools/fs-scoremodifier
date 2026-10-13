@@ -15,6 +15,10 @@ param allowedOrigins array = []
 @secure()
 param proxySharedSecret string = ''
 
+// Platform (site repo) storage account whose `competitions` table holds the
+// deletion date bound rows follow (platform_clock.py). Empty = feature off.
+param platformStorageAccountName string = ''
+
 resource appServicePlan 'Microsoft.Web/serverfarms@2023-12-01' = {
   name: appServicePlanName
   location: location
@@ -33,6 +37,8 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   kind: 'web'
   properties: {
     Application_Type: 'web'
+    // Telemetry can carry request details; keep it no longer than needed.
+    RetentionInDays: 30
   }
 }
 
@@ -67,6 +73,10 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
         {
           name: 'PROXY_SHARED_SECRET'
           value: proxySharedSecret
+        }
+        {
+          name: 'PLATFORM_STORAGE_ACCOUNT'
+          value: platformStorageAccountName
         }
       ]
     }

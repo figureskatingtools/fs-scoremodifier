@@ -17,6 +17,12 @@ param resourceGroupName string = ''
 @secure()
 param proxySharedSecret string = ''
 
+// Site repo's platform storage account (stfsplat*) whose `competitions` table
+// owns each competition's deletion date. Rows bound to a platform competition
+// (PlatformId) follow it; empty = every row keeps the tool's own 60-day clock.
+// The read grant comes from the site repo (TOOL_PRINCIPAL_ID_SCOREMODIFIER).
+param platformStorageAccountName string = ''
+
 resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = {
   name: resourceGroupName
   location: location
@@ -46,6 +52,7 @@ module function 'modules/function.bicep' = {
     // router Web App in the site repo does (server-to-server, CORS not applied).
     allowedOrigins: []
     proxySharedSecret: proxySharedSecret
+    platformStorageAccountName: platformStorageAccountName
   }
 }
 
