@@ -17,10 +17,12 @@ param resourceGroupName string = ''
 @secure()
 param proxySharedSecret string = ''
 
-// Site repo's platform storage account (stfsplat*) whose `competitions` table
-// owns each competition's deletion date. Rows bound to a platform competition
-// (PlatformId) follow it; empty = every row keeps the tool's own 60-day clock.
-// The read grant comes from the site repo (TOOL_PRINCIPAL_ID_SCOREMODIFIER).
+// Site repo's platform storage account (stfsplat*) whose `retentionclock` table
+// carries each competition's deletion verdict. Rows bound to a platform
+// competition (PlatformId) are deleted only when it says so. The tool has no
+// clock of its own: empty = bound rows are never deleted (and generation
+// stores no date) — local dev only. The read grant comes from the site repo
+// (TOOL_PRINCIPAL_ID_SCOREMODIFIER).
 param platformStorageAccountName string = ''
 
 resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = {

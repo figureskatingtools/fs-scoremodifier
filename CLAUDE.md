@@ -117,7 +117,7 @@ Four pieces:
    runs `extract_results` → `render_results_pdf` + `render_results_html`, stores `output/results.pdf`
    + `output/<CAT###RS>.htm`, writes a `competitions` row (`Tool="results"`) + a `generatedpapers` row
    per file, returns both URLs. Both generators **require** a **`platformId`** query param (the
-   site's active competition GUID; lowercased; missing/malformed → 400 `platform_id_required`),
+   site's active competition GUID; normalized; missing/malformed → 400 `platform_id_required`),
    stored as `PlatformId` on the row — see *Retention* below. **`parse_index`** (GET `?url=`) fetches + parses the competition
    index.htm (SSRF-guarded to `INDEX_ALLOWED_HOSTS`, default `figureskatingresults.fi`) → name/date/venue
    + category `CAT###RS.htm` list. `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
@@ -176,24 +176,25 @@ user-delegation key), connection string via `AzureWebJobsStorage` otherwise (loc
 
 The platform registry in `figureskatingtools-site` owns every competition's deletion date (created
 + 60 days, extended a week at a time **only on the site**). This tool has no retention period or
-extend action of its own. `infra/functions/platform_clock.py` reads the date from the platform
-storage account's `competitions` table (PK `COMPETITION`, RK GUID) — **keep that file
-byte-identical with fs-judgepapers and fs-protocolgenerator**. `PLATFORM_STORAGE_ACCOUNT` names the
-account; unset = the platform cannot be read.
+extend action of its own. `infra/functions/platform_clock.py` reads the platform's **`retentionclock`**
+table (PK `COMPETITION`, RK GUID; `DeletionDate`, `Status`, `PurgedUtc` — no personal data) on the
+platform storage account named by `PLATFORM_STORAGE_ACCOUNT` — **keep that file byte-identical with
+fs-judgepapers and fs-protocolgenerator** (its docstring is the contract).
 
-- **New rows:** `PlatformId` is required; `DeletionDate` is only a **cached copy** of the platform
-  date, read at generation. Unreadable then (outage, setting unset, not yet backfilled) → the row is
-  stored **without** a `DeletionDate` and the sweep caches it later; no local date is invented.
-  Unknown platform competition → 404 `platform_not_found`; deleted/purged → 410
-  `platform_deleted`; nothing is stored in either case.
-- **Sweep** (`auto_delete_expired_competitions` → `_run_cleanup_sweep`, 03:00 UTC like the
-  platform's): bound rows are deleted only when `platform_says_delete` (deleted, purged or past its
-  date), otherwise their cached date is refreshed; platform row not found → the cached
-  `DeletionDate` if any (none → kept, `logging.error`); platform unreadable or
-  `PLATFORM_STORAGE_ACCOUNT` unset → **skipped with `logging.error`, never deleted**. Legacy rows
-  without a `PlatformId` are deleted on their stored date (old 30-day rows keep it;
-  `_ensure_deletion_date` backfills `LEGACY_DELETION_DATE` on legacy rows only). One platform read
-  per GUID per run.
+- **New rows:** `platformId` is required (`normalize_platform_id`; 400 `platform_id_required`) and the
+  binding is confirmed against the platform before anything is stored: unreadable (outage, missing
+  table) → 503 `platform_unavailable`; unknown → 404 `platform_not_found`; deleted/purged → 410
+  `platform_deleted`. `DeletionDate` is only a **cached copy** of the platform date (absent while the
+  platform has none). With `PLATFORM_STORAGE_ACCOUNT` unset (local dev only) generation proceeds
+  without a date, and such rows are never deleted.
+- **Sweep** (`auto_delete_expired_competitions` → `_run_cleanup_sweep`, **04:00 UTC**, after the
+  platform's 03:00 sweep): one platform table client per run, one read per GUID. Bound rows are
+  deleted **only on the platform's verdict** (`platform_says_delete`: `Status == "deleted"` or
+  `PurgedUtc` — never a date alone), otherwise their cached date is refreshed; no clock row → kept
+  with `logging.warning`; platform unreadable or `PLATFORM_STORAGE_ACCOUNT` unset → **skipped with
+  `logging.error`, never deleted**. Legacy rows without a `PlatformId` are deleted on their stored
+  date (old 30-day rows keep it; `_ensure_deletion_date` backfills `LEGACY_DELETION_DATE` on legacy
+  rows only, in list, details and the sweep alike).
 - **No e-mail addresses on deleted rows:** deletion merges `CreatedBy=""` and
   `DeletedBy="user"|"auto-cleanup"`; every sweep also runs `_scrub_hidden_rows()`, blanking any
   other `CreatedBy`/`DeletedBy` value on `Visible=false` rows. Logs never carry addresses (the
@@ -209,7 +210,7 @@ changelog feed entry in `site/public/changelog-sources.json` (`tool: "Score Modi
 This repo only has to hand two values to the site repo's GitHub environments after an infra deploy
 (both are printed in the workflow's job summary): `FUNCTION_APP_URL_SCOREMODIFIER` (from
 `functionAppName`) and `TOOL_PRINCIPAL_ID_SCOREMODIFIER` (from `functionPrincipalId`). The latter is
-what grants this app's identity read access to the platform `competitions` table (and the
+what grants this app's identity read access to the platform `retentionclock` table (and the
 `competition-data` container), so the retention clock works only once the site's infra has been
 deployed with it. The
 `PROXY_SHARED_SECRET` value must match the site repo's `PROXY_SHARED_SECRET_SCOREMODIFIER` for the

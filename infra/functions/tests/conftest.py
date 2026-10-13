@@ -175,25 +175,39 @@ def storage(monkeypatch) -> FakeStorage:
     return st
 
 
-class _UnreachableTableClient:
-    """A platform table whose every read fails (network, RBAC, throttling)."""
+class _PlatformTableClient:
+    """One client on the platform `retentionclock` table; behaviour follows the
+    FakePlatform's switches at read time."""
 
-    def __init__(self):
-        self.reads = 0
+    def __init__(self, pf):
+        self.pf = pf
 
     def get_entity(self, partition_key, row_key):
-        self.reads += 1
-        raise HttpResponseError("platform registry unreachable")
+        pf = self.pf
+        pf.reads += 1
+        if pf.unreachable:
+            raise HttpResponseError("platform registry unreachable")
+        if pf.table_missing:
+            exc = ResourceNotFoundError("The table specified does not exist. ErrorCode:TableNotFound")
+            exc.error_code = "TableNotFound"
+            raise exc
+        try:
+            return dict(pf.rows[(partition_key, row_key)])
+        except KeyError:
+            exc = ResourceNotFoundError("The specified resource does not exist. ErrorCode:ResourceNotFound")
+            exc.error_code = "ResourceNotFound"
+            raise exc from None
 
 
 class FakePlatform:
-    """The site's platform ``competitions`` table (PK "COMPETITION", RK guid)."""
+    """The site's platform clock table (`retentionclock`, PK "COMPETITION", RK guid)."""
 
     def __init__(self):
         self.rows: dict = {}
         self.unreachable = False
-        self.reads = 0
-        self._broken = _UnreachableTableClient()
+        self.table_missing = False
+        self.clients = 0  # get_platform_table_client() calls
+        self.reads = 0  # get_entity() calls
 
     def add(self, guid, *, deletion, status="active", purged=None):
         row = {"PartitionKey": "COMPETITION", "RowKey": guid.lower(), "Status": status, "DeletionDate": deletion}
@@ -203,8 +217,8 @@ class FakePlatform:
         return row
 
     def client(self):
-        self.reads += 1
-        return self._broken if self.unreachable else FakeTableClient(self.rows)
+        self.clients += 1
+        return _PlatformTableClient(self)
 
 
 @pytest.fixture
@@ -213,6 +227,7 @@ def platform(monkeypatch) -> FakePlatform:
     pf = FakePlatform()
     monkeypatch.setenv("PLATFORM_STORAGE_ACCOUNT", "stfsplattest")
     monkeypatch.setattr(platform_clock, "get_platform_table_client", pf.client)
+    monkeypatch.setattr(fa, "get_platform_table_client", pf.client)  # the sweep's one client
     return pf
 
 

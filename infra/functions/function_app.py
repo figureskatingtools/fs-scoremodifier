@@ -25,6 +25,8 @@ from scoremodifier.index_meta import fetch_index_html, parse_index_html, match_c
 
 from platform_clock import (
     PlatformClockUnavailable,
+    get_platform_table_client,
+    normalize_platform_id,
     platform_says_delete,
     read_platform_clock,
     to_iso_z,
@@ -84,11 +86,6 @@ USER_DELETE_ACTOR = "user"
 # CreatedBy/DeletedBy values that are not an e-mail address. Anything else on a
 # hidden (deleted) row is scrubbed by the nightly sweep.
 NON_PERSONAL_ACTORS = frozenset({"", "-", USER_DELETE_ACTOR, AUTO_CLEANUP_ACTOR})
-
-# Platform competition ids are GUIDs (figureskatingtools-site registry).
-_PLATFORM_ID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-)
 
 
 def _utcnow() -> datetime:
@@ -325,20 +322,21 @@ class PlatformBindingError(Exception):
 
 def _platform_id_param(req: func.HttpRequest) -> str:
     """Required ``platformId`` query param (the site's active competition GUID),
-    lowercased. 400 platform_id_required when missing or malformed."""
-    raw = (req.params.get("platformId") or "").strip()
-    if not _PLATFORM_ID_RE.match(raw):
+    normalized. 400 platform_id_required when missing or malformed."""
+    platform_id = normalize_platform_id(req.params.get("platformId"))
+    if platform_id is None:
         raise PlatformBindingError(400, "platform_id_required")
-    return raw.lower()
+    return platform_id
 
 
 def _platform_deletion_date(platform_id: str) -> str | None:
-    """The platform competition's deletion date, cached on a new row.
+    """Confirm the binding and return the platform's deletion date to cache on a new row.
 
-    Raises PlatformBindingError for a competition the platform does not know
-    (404) or has deleted (410). Returns None when the date cannot be read right
-    now (feature off, outage, not yet backfilled on the platform): the row is
-    then stored without a date and the nightly sweep follows the platform.
+    Raises PlatformBindingError when the binding cannot be confirmed: the
+    platform clock is unreadable (503 platform_unavailable), does not know the
+    competition (404) or has deleted it (410) — nothing is stored then. Returns
+    None when the platform has no date yet, and when PLATFORM_STORAGE_ACCOUNT is
+    unset (local dev only: such rows are never deleted).
     """
     if not os.environ.get("PLATFORM_STORAGE_ACCOUNT"):
         logging.error("PLATFORM_STORAGE_ACCOUNT unset; storing the row without a deletion date")
@@ -346,8 +344,8 @@ def _platform_deletion_date(platform_id: str) -> str | None:
     try:
         clock = read_platform_clock(platform_id)
     except PlatformClockUnavailable:
-        logging.warning("Platform clock unavailable; storing the row without a deletion date")
-        return None
+        logging.error("Platform clock unavailable; generation refused")
+        raise PlatformBindingError(503, "platform_unavailable")
     if clock is None:
         raise PlatformBindingError(404, "platform_not_found")
     if clock.get("purged") or clock.get("status") == "deleted":
@@ -852,6 +850,10 @@ def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
     entity = get_competition_entity(comp_id)
     if not entity:
         return func.HttpResponse("Competition not found", status_code=404)
+    # Same effective legacy date as list_competitions and the sweep report.
+    comp_table = get_table_client("competitions")
+    if comp_table:
+        _ensure_deletion_date(comp_table, entity)
 
     generated_links = []
     try:
@@ -973,21 +975,21 @@ def delete_competition(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Internal server error", status_code=500)
 
 
-@app.timer_trigger(schedule="0 0 3 * * *", arg_name="timer", run_on_startup=False)
+@app.timer_trigger(schedule="0 0 4 * * *", arg_name="timer", run_on_startup=False)
 def auto_delete_expired_competitions(timer: func.TimerRequest) -> None:
-    """Daily sweep (03:00 UTC, the same night as the platform's): delete expired competitions."""
+    """Daily sweep (04:00 UTC, after the platform's 03:00 sweep): delete expired competitions."""
     _run_cleanup_sweep(datetime.now(timezone.utc))
 
 
 def _run_cleanup_sweep(now: datetime) -> int:
     """Delete competitions that are due, then scrub old soft-deleted rows.
 
-    Bound rows (PlatformId) are deleted only when the platform says so
-    (deleted, purged or past its date); their cached DeletionDate is refreshed
-    otherwise. A bound row whose platform competition is unknown falls back to
-    its cached date, if it has one. When the platform cannot be read (outage or
-    PLATFORM_STORAGE_ACCOUNT unset) bound rows are skipped with an error and
-    retried the next night — never deleted early. Legacy rows without a
+    Bound rows (PlatformId) are deleted only on the platform's verdict
+    (``platform_says_delete``: deleted or purged — never the date alone); their
+    cached DeletionDate is refreshed otherwise. A bound row whose platform clock
+    row is missing is kept with a warning. When the platform cannot be read
+    (outage, missing table, PLATFORM_STORAGE_ACCOUNT unset) bound rows are
+    skipped with an error and retried the next night. Legacy rows without a
     PlatformId are deleted on their stored DeletionDate. Returns the number of
     competitions deleted.
     """
@@ -999,8 +1001,16 @@ def _run_cleanup_sweep(now: datetime) -> int:
             logging.error("Auto-deletion: storage configuration invalid")
             return 0
 
-        platform_on = bool(os.environ.get("PLATFORM_STORAGE_ACCOUNT"))
+        # One platform table client (and credential) for the whole sweep.
+        platform_client, platform_error = None, None
+        try:
+            platform_client = get_platform_table_client()
+            if platform_client is None:
+                platform_error = "PLATFORM_STORAGE_ACCOUNT unset"
+        except Exception as exc:
+            platform_error = f"platform clock unavailable ({type(exc).__name__})"
         clocks: dict[str, object] = {}  # platform id -> clock | None | PlatformClockUnavailable
+
         for entity in list(comp_table.query_entities("PartitionKey eq 'GLOBAL'")):
             if entity.get("Visible") is False:
                 continue
@@ -1011,13 +1021,13 @@ def _run_cleanup_sweep(now: datetime) -> int:
                 _ensure_deletion_date(comp_table, entity)
                 deletion = _parse_iso_utc(entity.get("DeletionDate"))
                 due = deletion is not None and deletion <= now
-            elif not platform_on:
-                logging.error(f"Auto-deletion: PLATFORM_STORAGE_ACCOUNT unset; {row_id} skipped")
+            elif platform_error:
+                logging.error(f"Auto-deletion: {platform_error}; {row_id} skipped")
                 continue
             else:
                 if platform_id not in clocks:
                     try:
-                        clocks[platform_id] = read_platform_clock(platform_id)
+                        clocks[platform_id] = read_platform_clock(platform_id, table_client=platform_client)
                     except PlatformClockUnavailable as exc:
                         clocks[platform_id] = exc
                 clock = clocks[platform_id]
@@ -1025,15 +1035,11 @@ def _run_cleanup_sweep(now: datetime) -> int:
                     logging.error(f"Auto-deletion: platform clock unavailable for {row_id}; skipped until the next run")
                     continue
                 if clock is None:
-                    deletion = _parse_iso_utc(entity.get("DeletionDate"))
-                    if deletion is None:
-                        logging.error(f"Auto-deletion: {row_id} is bound to an unknown platform competition and has no cached date; kept")
-                        continue
-                    due = deletion <= now
-                else:
-                    due = platform_says_delete(clock, now)
-                    if not due:
-                        _sync_local_deletion_date(comp_table, entity, clock)
+                    logging.warning(f"Auto-deletion: no platform clock row for {row_id}; kept")
+                    continue
+                due = platform_says_delete(clock)
+                if not due:
+                    _sync_local_deletion_date(comp_table, entity, clock)
 
             if not due:
                 continue

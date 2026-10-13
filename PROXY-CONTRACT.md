@@ -87,7 +87,8 @@ curl -i "https://$FUNC.azurewebsites.net/api/check_user_permission" \
 
 # A real workload endpoint (PDF in the body). platformId = an existing platform
 # competition GUID (required; 400 platform_id_required without it, 404
-# platform_not_found for an unknown competition, 410 platform_deleted).
+# platform_not_found for an unknown competition, 410 platform_deleted, 503
+# platform_unavailable when the platform clock cannot be read — nothing stored).
 curl -i "https://$FUNC.azurewebsites.net/api/generate?includeRanks=false&platformId=$PLATFORM_ID" \
   -H "x-proxy-secret: $SECRET" \
   -H "x-forwarded-user-email: someone@example.com" \
