@@ -86,7 +86,6 @@ def test_every_route_requires_identity(synthetic_pdf):
     assert call(fa.list_competitions, make_request("list_competitions", method="GET", **anon)).status_code == 401
     assert call(fa.get_competition_details, make_request("get_competition_details", method="GET", params={"id": "x"}, **anon)).status_code == 401
     assert call(fa.delete_competition, make_request("delete_competition", params={"id": "x"}, **anon)).status_code == 401
-    assert call(fa.extend_competition_deletion, make_request("extend_competition_deletion", params={"id": "x"}, **anon)).status_code == 401
 
 
 def test_missing_identity_log_has_no_header_values(caplog):

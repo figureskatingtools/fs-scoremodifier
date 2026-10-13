@@ -52,6 +52,8 @@ import function_app as fa  # noqa: E402
 import platform_clock  # noqa: E402
 
 TEST_EMAIL = "tester@example.com"
+# The site's active competition (platformId is required on every generation).
+TEST_PLATFORM_ID = "0f8fad5b-d9cb-469f-a165-70867728950e"
 
 
 # ── dict-backed stand-ins for blob + table storage ────────────────────────────

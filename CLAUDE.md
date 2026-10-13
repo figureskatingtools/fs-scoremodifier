@@ -116,12 +116,12 @@ Four pieces:
    (POST, body = the PDF, metadata via query params `competition/date/venue/category/supertitle/catFile/indexUrl`):
    runs `extract_results` → `render_results_pdf` + `render_results_html`, stores `output/results.pdf`
    + `output/<CAT###RS>.htm`, writes a `competitions` row (`Tool="results"`) + a `generatedpapers` row
-   per file, returns both URLs. Both generators take an optional **`platformId`** query param (the
-   site's active competition GUID; validated, lowercased, 400 when malformed) stored as `PlatformId`
-   on the row — see *Retention* below. **`parse_index`** (GET `?url=`) fetches + parses the competition
+   per file, returns both URLs. Both generators **require** a **`platformId`** query param (the
+   site's active competition GUID; lowercased; missing/malformed → 400 `platform_id_required`),
+   stored as `PlatformId` on the row — see *Retention* below. **`parse_index`** (GET `?url=`) fetches + parses the competition
    index.htm (SSRF-guarded to `INDEX_ALLOWED_HOSTS`, default `figureskatingresults.fi`) → name/date/venue
    + category `CAT###RS.htm` list. `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
-   / `extend_competition_deletion` and the daily auto-delete timer are mirrored from judgepapers for
+   and the daily auto-delete timer are mirrored from judgepapers for
    future features / storage hygiene (not wired to the current UI). The auth/storage/SAS helpers are reused verbatim from
    judgepapers. **The function imports `scoremodifier.per_skater`**; the canonical package lives at the
    repo root and the build (`deploy_backend.sh` + CI) copies it into the function package — single
@@ -138,7 +138,7 @@ Four pieces:
    resource group, **own storage account** (`stfsscore…`, container `fs-scoremodifier`, tables
    `competitions` + `generatedpapers`, plus the `app-package` deploy container — no `categories`
    table), Flex Consumption Function App (system-assigned identity, CORS empty, `PLATFORM_STORAGE_ACCOUNT`
-   app setting from the `platformStorageAccountName` param), App Insights (30-day retention), and
+   app setting from the `platformStorageAccountName` param), App Insights, and
    RBAC (Blob Data Contributor + Table Data Contributor + Blob Delegator). No Web App, no auth
    managed identity, no DNS and no custom domain — those moved to the site repo. `main.bicep` exports
    `functionAppName` + `functionPrincipalId`, which the site repo consumes as its
@@ -172,28 +172,32 @@ derived from the PDF and are **not** unique — the id is the identifier. Every 
 two credential modes: managed identity when `AzureWebJobsStorage__accountName` is set (prod; SAS via
 user-delegation key), connection string via `AzureWebJobsStorage` otherwise (local; SAS via account key).
 
-### Retention (one platform clock)
+### Retention (one platform clock, no tool clock)
 
 The platform registry in `figureskatingtools-site` owns every competition's deletion date (created
-+ 60 days, extended a week at a time from the site). `infra/functions/platform_clock.py` reads it
-from the platform storage account's `competitions` table (PK `COMPETITION`, RK GUID) — **keep that
-file byte-identical with fs-judgepapers and fs-protocolgenerator**. Off when the
-`PLATFORM_STORAGE_ACCOUNT` app setting is empty.
++ 60 days, extended a week at a time **only on the site**). This tool has no retention period or
+extend action of its own. `infra/functions/platform_clock.py` reads the date from the platform
+storage account's `competitions` table (PK `COMPETITION`, RK GUID) — **keep that file
+byte-identical with fs-judgepapers and fs-protocolgenerator**. `PLATFORM_STORAGE_ACCOUNT` names the
+account; unset = the platform cannot be read.
 
-- **New rows:** `DeletionDate` = the platform date when `platformId` is given and readable, else
-  now + `DELETION_RETENTION_DAYS` (60). A platform outage never fails a generation.
-- **Sweep** (`auto_delete_expired_competitions`, 03:00 UTC like the platform's): bound rows are
-  deleted when the platform competition is deleted/purged or past its date (`platform_says_delete`);
-  no platform row or no date there → the local date; platform unreadable → **skipped and
-  `logging.error`, never deleted early**. Unbound rows keep the local clock. Not-yet-due bound
-  rows get their local `DeletionDate` synced to the platform's. One platform read per GUID per run.
-- **`extend_competition_deletion`** (POST `?id=`): bound → returns (and stores) the platform date
-  (`retentionManagedBy: "platform"`; 503 when unreadable, 410 `platform_deleted`); unbound → +7
-  days from max(current date, now). The real Extend action lives on the site.
+- **New rows:** `PlatformId` is required; `DeletionDate` is only a **cached copy** of the platform
+  date, read at generation. Unreadable then (outage, setting unset, not yet backfilled) → the row is
+  stored **without** a `DeletionDate` and the sweep caches it later; no local date is invented.
+  Unknown platform competition → 404 `platform_competition_not_found`; deleted/purged → 410
+  `platform_deleted`; nothing is stored in either case.
+- **Sweep** (`auto_delete_expired_competitions` → `_run_cleanup_sweep`, 03:00 UTC like the
+  platform's): bound rows are deleted only when `platform_says_delete` (deleted, purged or past its
+  date), otherwise their cached date is refreshed; platform row not found → the cached
+  `DeletionDate` if any (none → kept, `logging.error`); platform unreadable or
+  `PLATFORM_STORAGE_ACCOUNT` unset → **skipped with `logging.error`, never deleted**. Legacy rows
+  without a `PlatformId` are deleted on their stored date (old 30-day rows keep it;
+  `_ensure_deletion_date` backfills `LEGACY_DELETION_DATE` on legacy rows only). One platform read
+  per GUID per run.
 - **No e-mail addresses on deleted rows:** deletion merges `CreatedBy=""` and
   `DeletedBy="user"|"auto-cleanup"`; every sweep also runs `_scrub_hidden_rows()`, blanking any
   other `CreatedBy`/`DeletedBy` value on `Visible=false` rows. Logs never carry addresses (the
-  no-identity warning lists header names only); App Insights keeps 30 days (`RetentionInDays`).
+  no-identity warning lists header names only).
 
 ## Site integration
 
@@ -250,7 +254,7 @@ watched.
    judgepapers deploy app can be reused by adding an `fs-scoremodifier` federated-credential subject),
    `PROXY_SHARED_SECRET`. **Variables**: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `LOCATION`,
    `RESOURCE_GROUP_NAME`, `PLATFORM_STORAGE_ACCOUNT` (the site's `stfsplat*` account for that
-   environment — same value as fs-judgepapers'; empty = platform clock off). (`AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID` and `CUSTOM_DOMAIN` are obsolete —
+   environment — same value as fs-judgepapers'; empty = bound rows are never deleted). (`AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID` and `CUSTOM_DOMAIN` are obsolete —
    delete them once the old Web App is gone.)
 2. Run the deploy workflow (`test` via `workflow_dispatch`).
 3. Copy the job summary's `functionAppName` / `functionPrincipalId` into the `figureskatingtools-site`

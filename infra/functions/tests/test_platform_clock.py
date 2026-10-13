@@ -1,8 +1,10 @@
 """The platform retention clock (platform_clock.py) and how Score Modifier follows it.
 
-A row generated for a platform competition (``platformId`` query param ->
-``PlatformId``) is deleted on the platform's date; an unbound row keeps its own
-60-day clock. An unreachable platform never causes an early deletion.
+Every generation is bound to a platform competition (required ``platformId``
+query param -> ``PlatformId``) and deleted when the platform says so; the row's
+DeletionDate is only a cached copy. The tool has no clock of its own: legacy
+rows without a PlatformId keep their stored date, and an unreachable platform
+never causes a deletion.
 """
 
 import json
@@ -147,123 +149,105 @@ def _generate_results(pdf, params=None):
     return resp, (json.loads(resp.get_body()) if resp.status_code == 200 else None)
 
 
-def _assert_local_60_days(row):
-    deletion = fa._parse_iso_utc(row["DeletionDate"])
-    created = fa._parse_iso_utc(row["CreatedDate"])
-    assert _ISO_Z.match(row["DeletionDate"])
-    assert deletion - created == timedelta(days=60)
+GENERATORS = pytest.mark.parametrize("run", [_generate, _generate_results], ids=["generate", "generate_results"])
 
 
-@pytest.mark.parametrize("run", [_generate, _generate_results], ids=["generate", "generate_results"])
-def test_unbound_generation_keeps_60_days(run, fake_split, fake_results, storage):
-    assert fa.DELETION_RETENTION_DAYS == 60
-    resp, body = run(fake_split)
-    assert resp.status_code == 200, resp.get_body()
-    row = storage.competitions[("GLOBAL", body["id"])]
-    assert row["PlatformId"] == ""
-    assert row["CreatedBy"] == TEST_EMAIL
-    _assert_local_60_days(row)
+def test_no_local_retention_constants():
+    assert not hasattr(fa, "DELETION_RETENTION_DAYS")
+    assert not hasattr(fa, "DELETION_EXTENSION_DAYS")
+    assert not hasattr(fa, "extend_competition_deletion")
 
 
-@pytest.mark.parametrize("run", [_generate, _generate_results], ids=["generate", "generate_results"])
-def test_bound_generation_takes_the_platform_date(run, fake_split, fake_results, storage, platform):
+@GENERATORS
+@pytest.mark.parametrize("bad", [None, "", "not-a-guid", GUID + "0"])
+def test_platform_id_is_required(run, bad, fake_split, fake_results, storage, platform):
+    params = {} if bad is None else {"platformId": bad}
+    resp, _ = run(fake_split, params)
+    assert resp.status_code == 400
+    assert json.loads(resp.get_body()) == {"error": "platform_id_required"}
+    assert storage.competitions == {} and storage.blobs == {}
+
+
+@GENERATORS
+def test_generation_caches_the_platform_date(run, fake_split, fake_results, storage, platform):
     platform.add(GUID, deletion="2026-12-24T00:00:00Z")
     resp, body = run(fake_split, {"platformId": GUID.upper()})
     assert resp.status_code == 200, resp.get_body()
     row = storage.competitions[("GLOBAL", body["id"])]
     assert row["PlatformId"] == GUID  # lowercased
     assert row["DeletionDate"] == "2026-12-24T00:00:00Z"
+    assert row["CreatedBy"] == TEST_EMAIL
 
 
-@pytest.mark.parametrize("run", [_generate, _generate_results], ids=["generate", "generate_results"])
-def test_bound_generation_falls_back_to_local_clock(run, fake_split, fake_results, storage, platform):
-    # Unknown on the platform -> local 60 days, binding still stored.
-    resp, body = run(fake_split, {"platformId": GUID})
-    assert resp.status_code == 200
-    row = storage.competitions[("GLOBAL", body["id"])]
-    assert row["PlatformId"] == GUID
-    _assert_local_60_days(row)
-
-    # Platform unreachable -> the generation still succeeds on the local clock.
+@GENERATORS
+def test_generation_without_a_readable_date_stores_none(run, fake_split, fake_results, storage, platform, monkeypatch):
+    """Never invent a local date: unreadable now -> no DeletionDate, the sweep syncs it later."""
     platform.unreachable = True
     resp, body = run(fake_split, {"platformId": GUID})
     assert resp.status_code == 200
-    _assert_local_60_days(storage.competitions[("GLOBAL", body["id"])])
+    row = storage.competitions[("GLOBAL", body["id"])]
+    assert row["PlatformId"] == GUID and "DeletionDate" not in row
+
+    platform.unreachable = False
+    platform.add(GUID, deletion=None)  # not yet backfilled on the platform
+    resp, body = run(fake_split, {"platformId": GUID})
+    assert resp.status_code == 200
+    assert "DeletionDate" not in storage.competitions[("GLOBAL", body["id"])]
+
+    monkeypatch.delenv("PLATFORM_STORAGE_ACCOUNT")  # feature off
+    resp, body = run(fake_split, {"platformId": GUID})
+    assert resp.status_code == 200
+    assert "DeletionDate" not in storage.competitions[("GLOBAL", body["id"])]
 
 
-@pytest.mark.parametrize("run", [_generate, _generate_results], ids=["generate", "generate_results"])
-def test_invalid_platform_id_is_rejected(run, fake_split, fake_results, storage):
-    resp, _ = run(fake_split, {"platformId": "not-a-guid"})
-    assert resp.status_code == 400
-    assert b"platformId" in resp.get_body()
+@GENERATORS
+def test_generation_for_unknown_or_deleted_competition_is_refused(run, fake_split, fake_results, storage, platform):
+    resp, _ = run(fake_split, {"platformId": GUID})
+    assert resp.status_code == 404
+    assert json.loads(resp.get_body()) == {"error": "platform_competition_not_found"}
+
+    platform.add(GUID, deletion=_z(_midnight(1)), status="deleted")
+    resp, _ = run(fake_split, {"platformId": GUID})
+    assert resp.status_code == 410
+    assert json.loads(resp.get_body()) == {"error": "platform_deleted"}
+
+    platform.add(OTHER_GUID, deletion=_z(_midnight(-1)), status="deleted", purged=_z(_midnight(0)))
+    assert run(fake_split, {"platformId": OTHER_GUID})[0].status_code == 410
     assert storage.competitions == {} and storage.blobs == {}
 
 
-# ── extend ────────────────────────────────────────────────────────────────────
+# ── the nightly sweep ─────────────────────────────────────────────────────────
 
-def _seed(storage, comp_id, *, local_days, platform_id=""):
+def _seed(storage, comp_id, *, local_days=None, platform_id=""):
     folder = f"Comp {comp_id}-{comp_id}"
-    storage.competitions[("GLOBAL", comp_id)] = {
+    row = {
         "PartitionKey": "GLOBAL", "RowKey": comp_id, "Name": f"Comp {comp_id}", "FolderPath": folder,
-        "CreatedBy": "x@y", "CreatedDate": _z(_midnight(-1)), "Visible": True,
-        "DeletionDate": _z(_midnight(local_days)), "PlatformId": platform_id,
+        "CreatedBy": "x@y", "CreatedDate": _z(_midnight(-1)), "Visible": True, "PlatformId": platform_id,
     }
+    if local_days is not None:
+        row["DeletionDate"] = _z(_midnight(local_days))
+    storage.competitions[("GLOBAL", comp_id)] = row
     storage.blobs[f"{folder}/source.pdf"] = b"%PDF-src"
     return folder
 
 
-def _extend(comp_id):
-    resp = call(fa.extend_competition_deletion, make_request("extend_competition_deletion", params={"id": comp_id}))
-    return resp, (json.loads(resp.get_body()) if resp.status_code == 200 else None)
-
-
-def test_extend_bound_syncs_the_platform_date(storage, platform):
-    _seed(storage, "aaaaaaaa", local_days=3, platform_id=GUID)
-    platform.add(GUID, deletion=_z(_midnight(40)))
-    resp, body = _extend("aaaaaaaa")
-    assert resp.status_code == 200
-    assert body == {"deletionDate": _z(_midnight(40)), "retentionManagedBy": "platform"}
-    assert storage.competitions[("GLOBAL", "aaaaaaaa")]["DeletionDate"] == _z(_midnight(40))
-
-
-def test_extend_bound_platform_unknown_uses_local_clock(storage, platform):
-    _seed(storage, "aaaaaaaa", local_days=3, platform_id=GUID)
-    resp, body = _extend("aaaaaaaa")
-    assert resp.status_code == 200
-    assert body["deletionDate"] == _z(_midnight(10))
-
-
-def test_extend_bound_platform_unreachable_or_deleted(storage, platform):
-    _seed(storage, "aaaaaaaa", local_days=3, platform_id=GUID)
-    before = dict(storage.competitions[("GLOBAL", "aaaaaaaa")])
-    platform.unreachable = True
-    assert _extend("aaaaaaaa")[0].status_code == 503
-    platform.unreachable = False
-    platform.add(GUID, deletion=_z(_midnight(1)), status="deleted")
-    resp, _ = _extend("aaaaaaaa")
-    assert resp.status_code == 410
-    assert json.loads(resp.get_body()) == {"error": "platform_deleted"}
-    assert storage.competitions[("GLOBAL", "aaaaaaaa")] == before
+def _visible(storage, comp_id):
+    return storage.competitions[("GLOBAL", comp_id)]["Visible"]
 
 
 def test_details_report_platform_binding(storage):
     _seed(storage, "aaaaaaaa", local_days=3, platform_id=GUID)
     body = json.loads(call(fa.get_competition_details, make_request(
         "get_competition_details", method="GET", params={"id": "aaaaaaaa"})).get_body())
-    assert body["platformId"] == GUID and body["retentionManagedBy"] == "platform"
-
-
-# ── the nightly sweep ─────────────────────────────────────────────────────────
-
-def _visible(storage, comp_id):
-    return storage.competitions[("GLOBAL", comp_id)]["Visible"]
+    assert body["platformId"] == GUID
+    assert "retentionManagedBy" not in body
 
 
 def test_sweep_bound_rows_follow_the_platform(storage, platform):
-    # Platform date passed although the local date is far off -> deleted.
+    # Platform date passed although the cached date is far off -> deleted.
     gone = _seed(storage, "aaaaaaaa", local_days=30, platform_id=GUID)
     platform.add(GUID, deletion=_z(_midnight(0) - timedelta(hours=1)))
-    # Platform extended past an overdue local date -> kept, local date synced.
+    # Platform extended past an overdue cached date -> kept, cache refreshed.
     _seed(storage, "bbbbbbbb", local_days=-2, platform_id=OTHER_GUID)
     platform.add(OTHER_GUID, deletion=_z(_midnight(7)))
 
@@ -276,6 +260,14 @@ def test_sweep_bound_rows_follow_the_platform(storage, platform):
     assert storage.competitions[("GLOBAL", "bbbbbbbb")]["DeletionDate"] == _z(_midnight(7))
 
 
+def test_sweep_caches_the_date_on_rows_stored_without_one(storage, platform):
+    _seed(storage, "aaaaaaaa", platform_id=GUID)  # platform unreadable at generation
+    platform.add(GUID, deletion=_z(_midnight(20)))
+    _sweep()
+    assert _visible(storage, "aaaaaaaa") is True
+    assert storage.competitions[("GLOBAL", "aaaaaaaa")]["DeletionDate"] == _z(_midnight(20))
+
+
 def test_sweep_deletes_when_platform_purged_or_deleted(storage, platform):
     _seed(storage, "aaaaaaaa", local_days=30, platform_id=GUID)
     platform.add(GUID, deletion=_z(_midnight(30)), status="deleted", purged=_z(_midnight(0)))
@@ -286,9 +278,15 @@ def test_sweep_deletes_when_platform_purged_or_deleted(storage, platform):
     assert _visible(storage, "bbbbbbbb") is False
 
 
-def test_sweep_never_deletes_early_when_platform_unreachable(storage, platform, caplog):
-    folder = _seed(storage, "aaaaaaaa", local_days=-5, platform_id=GUID)  # overdue locally
-    _seed(storage, "cccccccc", local_days=-1)  # unbound: local clock still runs
+def test_sweep_platform_row_without_date_deletes_nothing(storage, platform):
+    _seed(storage, "aaaaaaaa", local_days=-1, platform_id=GUID)  # overdue cached copy
+    platform.add(GUID, deletion=None)  # not yet backfilled: the platform decides
+    _sweep()
+    assert _visible(storage, "aaaaaaaa") is True
+
+
+def test_sweep_never_deletes_when_platform_unreachable(storage, platform, caplog):
+    folder = _seed(storage, "aaaaaaaa", local_days=-5, platform_id=GUID)  # overdue cached copy
     platform.unreachable = True
 
     with caplog.at_level(logging.ERROR):
@@ -297,22 +295,40 @@ def test_sweep_never_deletes_early_when_platform_unreachable(storage, platform, 
     assert _visible(storage, "aaaaaaaa") is True
     assert f"{folder}/source.pdf" in storage.blobs
     assert any("platform clock unavailable" in r.getMessage() and r.levelno == logging.ERROR for r in caplog.records)
+
+
+def test_sweep_never_deletes_bound_rows_with_feature_off(storage, caplog):
+    """PLATFORM_STORAGE_ACCOUNT unset: bound rows are skipped with an error, legacy rows still run."""
+    _seed(storage, "aaaaaaaa", local_days=-1, platform_id=GUID)
+    _seed(storage, "cccccccc", local_days=-1)  # legacy, no PlatformId
+    with caplog.at_level(logging.ERROR):
+        _sweep()
+    assert _visible(storage, "aaaaaaaa") is True
     assert _visible(storage, "cccccccc") is False
+    assert any("PLATFORM_STORAGE_ACCOUNT unset" in r.getMessage() and r.levelno == logging.ERROR for r in caplog.records)
 
 
-def test_sweep_bound_but_unknown_on_platform_uses_local_date(storage, platform):
+def test_sweep_unknown_platform_competition_uses_cached_date(storage, platform, caplog):
     _seed(storage, "aaaaaaaa", local_days=-1, platform_id=GUID)
     _seed(storage, "bbbbbbbb", local_days=+1, platform_id=OTHER_GUID)
+    _seed(storage, "cccccccc", platform_id="7c9e6679-7425-40de-944b-e07fc1f90000")  # no cached date
+    with caplog.at_level(logging.ERROR):
+        _sweep()
+    assert _visible(storage, "aaaaaaaa") is False
+    assert _visible(storage, "bbbbbbbb") is True
+    assert _visible(storage, "cccccccc") is True
+    assert "DeletionDate" not in storage.competitions[("GLOBAL", "cccccccc")]  # never backfilled locally
+    assert any("unknown platform competition" in r.getMessage() for r in caplog.records)
+
+
+def test_sweep_legacy_rows_keep_their_stored_date(storage, platform):
+    _seed(storage, "aaaaaaaa", local_days=-1)
+    _seed(storage, "bbbbbbbb", local_days=+25)  # an old 30-day row keeps its date
     _sweep()
     assert _visible(storage, "aaaaaaaa") is False
     assert _visible(storage, "bbbbbbbb") is True
-
-
-def test_sweep_platform_row_without_date_uses_local_date(storage, platform):
-    _seed(storage, "aaaaaaaa", local_days=-1, platform_id=GUID)
-    platform.add(GUID, deletion=None)  # not yet backfilled on the platform
-    _sweep()
-    assert _visible(storage, "aaaaaaaa") is False
+    assert storage.competitions[("GLOBAL", "bbbbbbbb")]["DeletionDate"] == _z(_midnight(25))
+    assert platform.reads == 0  # legacy rows never consult the platform
 
 
 def test_sweep_reads_each_platform_competition_once(storage, platform):
@@ -321,12 +337,3 @@ def test_sweep_reads_each_platform_competition_once(storage, platform):
     platform.add(GUID, deletion=_z(_midnight(20)))
     _sweep()
     assert platform.reads == 1
-
-
-def test_sweep_without_platform_account_keeps_local_clock(storage):
-    """Feature off (PLATFORM_STORAGE_ACCOUNT unset): bound rows use the local date."""
-    _seed(storage, "aaaaaaaa", local_days=-1, platform_id=GUID)
-    _seed(storage, "bbbbbbbb", local_days=+1, platform_id=GUID)
-    _sweep()
-    assert _visible(storage, "aaaaaaaa") is False
-    assert _visible(storage, "bbbbbbbb") is True

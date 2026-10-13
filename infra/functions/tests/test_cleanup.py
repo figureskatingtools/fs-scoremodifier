@@ -96,37 +96,6 @@ def test_auto_delete_sweep(storage):
     assert any(b.startswith("Comp 33333333-33333333/") for b in storage.blobs)
 
 
-def test_extend_unbound_adds_a_week(storage):
-    _seed(storage, "aaaaaaaa", days_from_now=10)
-    before = fa._parse_iso_utc(storage.competitions[("GLOBAL", "aaaaaaaa")]["DeletionDate"])
-
-    resp = call(fa.extend_competition_deletion, make_request("extend_competition_deletion", params={"id": "aaaaaaaa"}))
-    assert resp.status_code == 200, resp.get_body()
-    body = json.loads(resp.get_body())
-    assert body["retentionManagedBy"] == "tool"
-    stored = storage.competitions[("GLOBAL", "aaaaaaaa")]["DeletionDate"]
-    assert body["deletionDate"] == stored and _ISO_Z.match(stored)
-    assert fa._parse_iso_utc(stored) - before == timedelta(days=fa.DELETION_EXTENSION_DAYS)
-
-
-def test_extend_overdue_counts_from_now(storage):
-    _seed(storage, "aaaaaaaa", days_from_now=-3)  # the sweep has not run yet
-    resp = call(fa.extend_competition_deletion, make_request("extend_competition_deletion", params={"id": "aaaaaaaa"}))
-    assert resp.status_code == 200
-    new = fa._parse_iso_utc(json.loads(resp.get_body())["deletionDate"])
-    expected = datetime.now(timezone.utc) + timedelta(days=fa.DELETION_EXTENSION_DAYS)
-    assert abs((new - expected).total_seconds()) < 60
-
-
-def test_extend_guards(storage):
-    _seed(storage, "bbbbbbbb", days_from_now=10, visible=False)
-    ext = fa.extend_competition_deletion
-    assert call(ext, make_request("extend_competition_deletion")).status_code == 400
-    assert call(ext, make_request("extend_competition_deletion", params={"id": "nope"})).status_code == 404
-    assert call(ext, make_request("extend_competition_deletion", params={"id": "bbbbbbbb"})).status_code == 404
-    assert call(ext, make_request("extend_competition_deletion", params={"id": "bbbbbbbb"}, email=None)).status_code == 401
-
-
 def test_sweep_scrubs_addresses_from_old_deleted_rows(storage):
     """Rows soft-deleted before deletion started scrubbing still carry e-mail
     addresses; the nightly run blanks them and leaves everything else alone."""
@@ -157,7 +126,7 @@ def test_details_report_retention(storage):
     _seed(storage, "aaaaaaaa", days_from_now=10)
     body = json.loads(call(fa.get_competition_details, make_request(
         "get_competition_details", method="GET", params={"id": "aaaaaaaa"})).get_body())
-    assert body["retentionManagedBy"] == "tool" and body["platformId"] is None
+    assert body["platformId"] is None
     assert body["deletionDate"] == storage.competitions[("GLOBAL", "aaaaaaaa")]["DeletionDate"]
 
 

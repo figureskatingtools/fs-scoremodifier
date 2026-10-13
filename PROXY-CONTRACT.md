@@ -85,8 +85,9 @@ curl -i "https://$FUNC.azurewebsites.net/api/check_user_permission" \
 curl -i "https://$FUNC.azurewebsites.net/api/check_user_permission" \
   -H "x-forwarded-user-email: someone@example.com"
 
-# A real workload endpoint (PDF in the body)
-curl -i "https://$FUNC.azurewebsites.net/api/generate?includeRanks=false" \
+# A real workload endpoint (PDF in the body). platformId = an existing platform
+# competition GUID (required; 400 platform_id_required without it).
+curl -i "https://$FUNC.azurewebsites.net/api/generate?includeRanks=false&platformId=$PLATFORM_ID" \
   -H "x-proxy-secret: $SECRET" \
   -H "x-forwarded-user-email: someone@example.com" \
   -H "content-type: application/pdf" \
