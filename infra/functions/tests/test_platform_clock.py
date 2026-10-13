@@ -204,7 +204,7 @@ def test_generation_without_a_readable_date_stores_none(run, fake_split, fake_re
 def test_generation_for_unknown_or_deleted_competition_is_refused(run, fake_split, fake_results, storage, platform):
     resp, _ = run(fake_split, {"platformId": GUID})
     assert resp.status_code == 404
-    assert json.loads(resp.get_body()) == {"error": "platform_competition_not_found"}
+    assert json.loads(resp.get_body()) == {"error": "platform_not_found"}
 
     platform.add(GUID, deletion=_z(_midnight(1)), status="deleted")
     resp, _ = run(fake_split, {"platformId": GUID})

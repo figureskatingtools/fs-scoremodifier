@@ -349,7 +349,7 @@ def _platform_deletion_date(platform_id: str) -> str | None:
         logging.warning("Platform clock unavailable; storing the row without a deletion date")
         return None
     if clock is None:
-        raise PlatformBindingError(404, "platform_competition_not_found")
+        raise PlatformBindingError(404, "platform_not_found")
     if clock.get("purged") or clock.get("status") == "deleted":
         raise PlatformBindingError(410, "platform_deleted")
     deletion = clock.get("deletionDate")

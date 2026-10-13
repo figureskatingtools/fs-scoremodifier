@@ -184,7 +184,7 @@ account; unset = the platform cannot be read.
 - **New rows:** `PlatformId` is required; `DeletionDate` is only a **cached copy** of the platform
   date, read at generation. Unreadable then (outage, setting unset, not yet backfilled) → the row is
   stored **without** a `DeletionDate` and the sweep caches it later; no local date is invented.
-  Unknown platform competition → 404 `platform_competition_not_found`; deleted/purged → 410
+  Unknown platform competition → 404 `platform_not_found`; deleted/purged → 410
   `platform_deleted`; nothing is stored in either case.
 - **Sweep** (`auto_delete_expired_competitions` → `_run_cleanup_sweep`, 03:00 UTC like the
   platform's): bound rows are deleted only when `platform_says_delete` (deleted, purged or past its
