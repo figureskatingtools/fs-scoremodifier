@@ -4,8 +4,6 @@
 # environment before merging (merging deploys prod).
 #
 # NOTE: this file is only read from the default branch (main).
-# NOTE: frontend/ is a pre-migration leftover that is no longer built or
-# deployed (the UI lives in figureskatingtools-site), so it is not watched.
 version: 2
 
 updates:

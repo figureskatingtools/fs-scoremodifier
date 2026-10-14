@@ -97,7 +97,6 @@ scoremodifier/        # core PDF logic + CLI (canonical; bundled into the functi
 infra/
   main.bicep, modules/, parameters/   # subscription-scoped IaC
   functions/          # Python Azure Functions backend (function_app.py)
-frontend/             # pre-migration UI copy — not built or deployed (see frontend/README.md)
 PROXY-CONTRACT.md     # header contract between the site router and this backend
 deploy_infra.sh, deploy_backend.sh
 .github/workflows/deploy.yml
