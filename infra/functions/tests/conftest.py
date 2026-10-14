@@ -41,15 +41,19 @@ os.environ["AzureWebJobsStorage"] = (
 )
 os.environ.pop("AzureWebJobsStorage__accountName", None)
 os.environ.pop("PROXY_SHARED_SECRET", None)
+os.environ.pop("PLATFORM_STORAGE_ACCOUNT", None)
 
 import fitz  # noqa: E402
 import pytest  # noqa: E402
 import azure.functions as func  # noqa: E402
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError  # noqa: E402
+from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError  # noqa: E402
 
 import function_app as fa  # noqa: E402
+import platform_clock  # noqa: E402
 
 TEST_EMAIL = "tester@example.com"
+# The site's active competition (platformId is required on every generation).
+TEST_PLATFORM_ID = "0f8fad5b-d9cb-469f-a165-70867728950e"
 
 
 # ── dict-backed stand-ins for blob + table storage ────────────────────────────
@@ -166,7 +170,65 @@ def storage(monkeypatch) -> FakeStorage:
     monkeypatch.setattr(fa, "get_blob_service_client", lambda: st.blob_service)
     monkeypatch.setattr(fa, "get_table_client", lambda table_name="generatedpapers": st.table(table_name))
     monkeypatch.delenv("PROXY_SHARED_SECRET", raising=False)
+    # Platform clock off unless a test opts in with the `platform` fixture.
+    monkeypatch.delenv("PLATFORM_STORAGE_ACCOUNT", raising=False)
     return st
+
+
+class _PlatformTableClient:
+    """One client on the platform `retentionclock` table; behaviour follows the
+    FakePlatform's switches at read time."""
+
+    def __init__(self, pf):
+        self.pf = pf
+
+    def get_entity(self, partition_key, row_key):
+        pf = self.pf
+        pf.reads += 1
+        if pf.unreachable:
+            raise HttpResponseError("platform registry unreachable")
+        if pf.table_missing:
+            exc = ResourceNotFoundError("The table specified does not exist. ErrorCode:TableNotFound")
+            exc.error_code = "TableNotFound"
+            raise exc
+        try:
+            return dict(pf.rows[(partition_key, row_key)])
+        except KeyError:
+            exc = ResourceNotFoundError("The specified resource does not exist. ErrorCode:ResourceNotFound")
+            exc.error_code = "ResourceNotFound"
+            raise exc from None
+
+
+class FakePlatform:
+    """The site's platform clock table (`retentionclock`, PK "COMPETITION", RK guid)."""
+
+    def __init__(self):
+        self.rows: dict = {}
+        self.unreachable = False
+        self.table_missing = False
+        self.clients = 0  # get_platform_table_client() calls
+        self.reads = 0  # get_entity() calls
+
+    def add(self, guid, *, deletion, status="active", purged=None):
+        row = {"PartitionKey": "COMPETITION", "RowKey": guid.lower(), "Status": status, "DeletionDate": deletion}
+        if purged:
+            row["PurgedUtc"] = purged
+        self.rows[("COMPETITION", guid.lower())] = row
+        return row
+
+    def client(self):
+        self.clients += 1
+        return _PlatformTableClient(self)
+
+
+@pytest.fixture
+def platform(monkeypatch) -> FakePlatform:
+    """Turn the platform clock on, backed by an in-memory registry."""
+    pf = FakePlatform()
+    monkeypatch.setenv("PLATFORM_STORAGE_ACCOUNT", "stfsplattest")
+    monkeypatch.setattr(platform_clock, "get_platform_table_client", pf.client)
+    monkeypatch.setattr(fa, "get_platform_table_client", pf.client)  # the sweep's one client
+    return pf
 
 
 # ── requests ──────────────────────────────────────────────────────────────────

@@ -73,7 +73,9 @@ cd infra/functions && PYTHONPATH=$(git rev-parse --show-toplevel) \
 
 `infra/functions/tests/` runs the real `function_app` handlers against dict-backed blob/table
 fakes (`conftest.py`), the SAS path with a dummy account key, the proxy auth contract, the
-auto-delete sweep, and the `scoremodifier` package on real FSM exports. Sample exports are **not
+auto-delete sweep and e-mail scrubbing, the platform retention clock (`test_platform_clock.py`,
+against an in-memory platform registry from the `platform` fixture; the clock is off in every
+other test), and the `scoremodifier` package on real FSM exports. Sample exports are **not
 committed** (skaters' names): the suite reads `SCOREMODIFIER_SAMPLE_DIR` (default
 `../fs-samples/scoremodifier`, one directory per competition holding `source.pdf` and optionally
 `output/per-skater.pdf` / `output/results.pdf` as goldens — exactly the tool's own storage layout,
@@ -114,11 +116,13 @@ Four pieces:
    (POST, body = the PDF, metadata via query params `competition/date/venue/category/supertitle/catFile/indexUrl`):
    runs `extract_results` → `render_results_pdf` + `render_results_html`, stores `output/results.pdf`
    + `output/<CAT###RS>.htm`, writes a `competitions` row (`Tool="results"`) + a `generatedpapers` row
-   per file, returns both URLs. **`parse_index`** (GET `?url=`) fetches + parses the competition
+   per file, returns both URLs. Both generators **require** a **`platformId`** query param (the
+   site's active competition GUID; normalized; missing/malformed → 400 `platform_id_required`),
+   stored as `PlatformId` on the row — see *Retention* below. **`parse_index`** (GET `?url=`) fetches + parses the competition
    index.htm (SSRF-guarded to `INDEX_ALLOWED_HOSTS`, default `figureskatingresults.fi`) → name/date/venue
    + category `CAT###RS.htm` list. `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
-   and a daily 30-day auto-delete timer are mirrored from judgepapers for future features / storage
-   hygiene (not wired to the current UI). The auth/storage/SAS helpers are reused verbatim from
+   and the daily auto-delete timer are mirrored from judgepapers for
+   future features / storage hygiene (not wired to the current UI). The auth/storage/SAS helpers are reused verbatim from
    judgepapers. **The function imports `scoremodifier.per_skater`**; the canonical package lives at the
    repo root and the build (`deploy_backend.sh` + CI) copies it into the function package — single
    source of truth, no duplication. Locally, `PYTHONPATH=<repo root>` makes the import resolve.
@@ -133,7 +137,8 @@ Four pieces:
 4. **Infra** (`infra/main.bicep` + `modules/`) — subscription-scoped Bicep, **backend-only**:
    resource group, **own storage account** (`stfsscore…`, container `fs-scoremodifier`, tables
    `competitions` + `generatedpapers`, plus the `app-package` deploy container — no `categories`
-   table), Flex Consumption Function App (system-assigned identity, CORS empty), App Insights, and
+   table), Flex Consumption Function App (system-assigned identity, CORS empty, `PLATFORM_STORAGE_ACCOUNT`
+   app setting from the `platformStorageAccountName` param), App Insights, and
    RBAC (Blob Data Contributor + Table Data Contributor + Blob Delegator). No Web App, no auth
    managed identity, no DNS and no custom domain — those moved to the site repo. `main.bicep` exports
    `functionAppName` + `functionPrincipalId`, which the site repo consumes as its
@@ -162,10 +167,38 @@ Storage account is dedicated to this tool. Container `fs-scoremodifier`:
 - `{sanitized-name}-{id}/output/per-skater.pdf` — the generated result
 Tables: `competitions` (PartitionKey `GLOBAL`, RowKey = 8-char hex id; `Name`, `FolderPath`, `Segment`,
 `PrintedDate`, `IncludeRanks`, `OutputPages`, `Visible`, `CreatedBy/CreatedDate`, `DeletionDate`,
-counters) and `generatedpapers` (PartitionKey = competition id; SAS download links). Names are auto-
+counters, optional `PlatformId`) and `generatedpapers` (PartitionKey = competition id; SAS download links). Names are auto-
 derived from the PDF and are **not** unique — the id is the identifier. Every storage helper supports
 two credential modes: managed identity when `AzureWebJobsStorage__accountName` is set (prod; SAS via
 user-delegation key), connection string via `AzureWebJobsStorage` otherwise (local; SAS via account key).
+
+### Retention (one platform clock, no tool clock)
+
+The platform registry in `figureskatingtools-site` owns every competition's deletion date (created
++ 60 days, extended a week at a time **only on the site**). This tool has no retention period or
+extend action of its own. `infra/functions/platform_clock.py` reads the platform's **`retentionclock`**
+table (PK `COMPETITION`, RK GUID; `DeletionDate`, `Status`, `PurgedUtc` — no personal data) on the
+platform storage account named by `PLATFORM_STORAGE_ACCOUNT` — **keep that file byte-identical with
+fs-judgepapers and fs-protocolgenerator** (its docstring is the contract).
+
+- **New rows:** `platformId` is required (`normalize_platform_id`; 400 `platform_id_required`) and the
+  binding is confirmed against the platform before anything is stored: unreadable (outage, missing
+  table) → 503 `platform_unavailable`; unknown → 404 `platform_not_found`; deleted/purged → 410
+  `platform_deleted`. `DeletionDate` is only a **cached copy** of the platform date (absent while the
+  platform has none). With `PLATFORM_STORAGE_ACCOUNT` unset (local dev only) generation proceeds
+  without a date, and such rows are never deleted.
+- **Sweep** (`auto_delete_expired_competitions` → `_run_cleanup_sweep`, **04:00 UTC**, after the
+  platform's 03:00 sweep): one platform table client per run, one read per GUID. Bound rows are
+  deleted **only on the platform's verdict** (`platform_says_delete`: `Status == "deleted"` or
+  `PurgedUtc` — never a date alone), otherwise their cached date is refreshed; no clock row → kept
+  with `logging.warning`; platform unreadable or `PLATFORM_STORAGE_ACCOUNT` unset → **skipped with
+  `logging.error`, never deleted**. Legacy rows without a `PlatformId` are deleted on their stored
+  date (old 30-day rows keep it; `_ensure_deletion_date` backfills `LEGACY_DELETION_DATE` on legacy
+  rows only, in list, details and the sweep alike).
+- **No e-mail addresses on deleted rows:** deletion merges `CreatedBy=""` and
+  `DeletedBy="user"|"auto-cleanup"`; every sweep also runs `_scrub_hidden_rows()`, blanking any
+  other `CreatedBy`/`DeletedBy` value on `Visible=false` rows. Logs never carry addresses (the
+  no-identity warning lists header names only).
 
 ## Site integration
 
@@ -176,7 +209,10 @@ changelog feed entry in `site/public/changelog-sources.json` (`tool: "Score Modi
 
 This repo only has to hand two values to the site repo's GitHub environments after an infra deploy
 (both are printed in the workflow's job summary): `FUNCTION_APP_URL_SCOREMODIFIER` (from
-`functionAppName`) and `TOOL_PRINCIPAL_ID_SCOREMODIFIER` (from `functionPrincipalId`). The
+`functionAppName`) and `TOOL_PRINCIPAL_ID_SCOREMODIFIER` (from `functionPrincipalId`). The latter is
+what grants this app's identity read access to the platform `retentionclock` table (and the
+`competition-data` container), so the retention clock works only once the site's infra has been
+deployed with it. The
 `PROXY_SHARED_SECRET` value must match the site repo's `PROXY_SHARED_SECRET_SCOREMODIFIER` for the
 same environment.
 
@@ -218,7 +254,8 @@ watched.
 1. GitHub Environment (`test` / `prod`) **secrets**: `AZURE_CLIENT_ID` (OIDC deploy principal — the
    judgepapers deploy app can be reused by adding an `fs-scoremodifier` federated-credential subject),
    `PROXY_SHARED_SECRET`. **Variables**: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `LOCATION`,
-   `RESOURCE_GROUP_NAME`. (`AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID` and `CUSTOM_DOMAIN` are obsolete —
+   `RESOURCE_GROUP_NAME`, `PLATFORM_STORAGE_ACCOUNT` (the site's `stfsplat*` account for that
+   environment — same value as fs-judgepapers'; empty = bound rows are never deleted). (`AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID` and `CUSTOM_DOMAIN` are obsolete —
    delete them once the old Web App is gone.)
 2. Run the deploy workflow (`test` via `workflow_dispatch`).
 3. Copy the job summary's `functionAppName` / `functionPrincipalId` into the `figureskatingtools-site`

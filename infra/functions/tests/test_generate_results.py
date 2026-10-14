@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from conftest import call, make_request, page_texts
+from conftest import TEST_PLATFORM_ID, call, make_request, page_texts
 
 import function_app as fa
 from scoremodifier import index_meta
@@ -22,7 +22,8 @@ INDEX_HTML = """<html><head><title>Test Cup 2026</title></head><body>
 
 
 def _run(pdf, params=None):
-    resp = call(fa.generate_results, make_request("generate_results", body=pdf, params=params or {}))
+    params = {"platformId": TEST_PLATFORM_ID, **(params or {})}
+    resp = call(fa.generate_results, make_request("generate_results", body=pdf, params=params))
     return resp, (json.loads(resp.get_body()) if resp.status_code == 200 else None)
 
 

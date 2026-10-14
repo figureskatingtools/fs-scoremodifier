@@ -15,6 +15,10 @@ param allowedOrigins array = []
 @secure()
 param proxySharedSecret string = ''
 
+// Platform (site repo) storage account whose `retentionclock` table bound rows
+// follow (platform_clock.py). Empty = bound rows are never deleted (no local clock).
+param platformStorageAccountName string = ''
+
 resource appServicePlan 'Microsoft.Web/serverfarms@2023-12-01' = {
   name: appServicePlanName
   location: location
@@ -67,6 +71,10 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
         {
           name: 'PROXY_SHARED_SECRET'
           value: proxySharedSecret
+        }
+        {
+          name: 'PLATFORM_STORAGE_ACCOUNT'
+          value: platformStorageAccountName
         }
       ]
     }

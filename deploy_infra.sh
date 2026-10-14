@@ -10,12 +10,14 @@ TEMPLATE_FILE="infra/main.bicep"
 
 PROXY_SECRET=""
 RESOURCE_GROUP=""
+PLATFORM_STORAGE=""
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -s|--proxy-secret) PROXY_SECRET="$2"; shift ;;
         -g|--resource-group) RESOURCE_GROUP="$2"; shift ;;
+        -p|--platform-storage) PLATFORM_STORAGE="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
@@ -23,7 +25,7 @@ done
 
 if [ -z "$RESOURCE_GROUP" ]; then
     echo "Error: --resource-group argument is required."
-    echo "Usage: ./deploy_infra.sh --resource-group <NAME> [--proxy-secret <SECRET>]"
+    echo "Usage: ./deploy_infra.sh --resource-group <NAME> [--proxy-secret <SECRET>] [--platform-storage <ACCOUNT>]"
     exit 1
 fi
 
@@ -39,6 +41,7 @@ az deployment sub create \
   --location "$LOCATION" \
   --template-file "$TEMPLATE_FILE" \
   --name "deploy-fs-scoremodifier-$(date +%s)" \
-  --parameters resourceGroupName="$RESOURCE_GROUP" proxySharedSecret="$PROXY_SECRET"
+  --parameters resourceGroupName="$RESOURCE_GROUP" proxySharedSecret="$PROXY_SECRET" \
+    platformStorageAccountName="$PLATFORM_STORAGE"
 
 echo "Infrastructure deployment complete."

@@ -86,3 +86,12 @@ def test_every_route_requires_identity(synthetic_pdf):
     assert call(fa.list_competitions, make_request("list_competitions", method="GET", **anon)).status_code == 401
     assert call(fa.get_competition_details, make_request("get_competition_details", method="GET", params={"id": "x"}, **anon)).status_code == 401
     assert call(fa.delete_competition, make_request("delete_competition", params={"id": "x"}, **anon)).status_code == 401
+
+
+def test_missing_identity_log_has_no_header_values(caplog):
+    req = make_request("x", email=None, headers={"X-Client-IP": "203.0.113.7", "X-Other": "someone@example.com"})
+    with caplog.at_level("WARNING"):
+        assert fa.get_user_email_from_header(req) is None
+    logged = caplog.text
+    assert "x-client-ip" in logged and "x-other" in logged  # names only
+    assert "203.0.113.7" not in logged and "someone@example.com" not in logged

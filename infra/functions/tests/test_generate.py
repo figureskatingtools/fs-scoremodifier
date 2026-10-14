@@ -4,30 +4,35 @@ import json
 import re
 from urllib.parse import urlparse
 
-from conftest import TEST_EMAIL, call, make_request, page_texts, rank_anchor_count, teams_or_none
+from conftest import TEST_EMAIL, TEST_PLATFORM_ID, call, make_request, page_texts, rank_anchor_count, teams_or_none
 
 import function_app as fa
 
 _ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
 
 
+def _gen_request(body, params=None, **kw):
+    """A generate request for the active platform competition."""
+    return make_request("generate", body=body, params={"platformId": TEST_PLATFORM_ID, **(params or {})}, **kw)
+
+
 def test_rejects_empty_and_non_pdf_bodies():
-    assert call(fa.generate, make_request("generate", body=b"")).status_code == 400
-    resp = call(fa.generate, make_request("generate", body=b"hello, not a pdf"))
+    assert call(fa.generate, _gen_request(body=b"")).status_code == 400
+    resp = call(fa.generate, _gen_request(body=b"hello, not a pdf"))
     assert resp.status_code == 400
     assert b"Only PDF" in resp.get_body()
 
 
 def test_rejects_oversized_uploads():
     too_big = fa.MAX_UPLOAD_SIZE + 1
-    resp = call(fa.generate, make_request("generate", body=b"%PDF-", headers={"Content-Length": str(too_big)}))
+    resp = call(fa.generate, _gen_request(body=b"%PDF-", headers={"Content-Length": str(too_big)}))
     assert resp.status_code == 413
-    resp = call(fa.generate, make_request("generate", body=b"%PDF-" + b"\0" * too_big))
+    resp = call(fa.generate, _gen_request(body=b"%PDF-" + b"\0" * too_big))
     assert resp.status_code == 413
 
 
 def test_rejects_a_pdf_that_is_not_the_report(synthetic_pdf, storage):
-    resp = call(fa.generate, make_request("generate", body=synthetic_pdf))
+    resp = call(fa.generate, _gen_request(body=synthetic_pdf))
     assert resp.status_code == 400
     assert b"JUDGES DETAILS PER SKATER" in resp.get_body()
     assert storage.blobs == {} and storage.competitions == {}
@@ -38,7 +43,7 @@ def test_generate_happy_path(sample_pdf, storage):
     _, segment, printed = fa.derive_name_and_meta(sample_pdf)
     assert segment and printed
 
-    resp = call(fa.generate, make_request("generate", body=sample_pdf, params={"includeRanks": "false"}))
+    resp = call(fa.generate, _gen_request(body=sample_pdf, params={"includeRanks": "false"}))
     assert resp.status_code == 200, resp.get_body()
     body = json.loads(resp.get_body())
     assert set(body) == {"id", "name", "fileName", "downloadUrl", "pages", "expiration"}
@@ -60,7 +65,11 @@ def test_generate_happy_path(sample_pdf, storage):
     assert row["UploadedFileCount"] == 1 and row["GenerateRunCount"] == 1
     # Naive-UTC ISO + literal Z, never an offset (the format every reader expects).
     assert _ISO_Z.match(row["CreatedDate"]), row["CreatedDate"]
-    assert _ISO_Z.match(row["DeletionDate"]), row["DeletionDate"]
+    # Bound to the platform competition; with the platform clock off (no
+    # PLATFORM_STORAGE_ACCOUNT here) there is no date to cache — see
+    # test_platform_clock.py for the cached copy.
+    assert row["PlatformId"] == TEST_PLATFORM_ID
+    assert "DeletionDate" not in row
 
     # Source + output blobs under that folder; output is the split PDF.
     folder = row["FolderPath"]
@@ -81,8 +90,8 @@ def test_generate_happy_path(sample_pdf, storage):
 
 
 def test_include_ranks_flag_is_persisted_and_changes_output(sample_pdf, storage):
-    hidden = call(fa.generate, make_request("generate", body=sample_pdf))
-    shown = call(fa.generate, make_request("generate", body=sample_pdf, params={"includeRanks": "true"}))
+    hidden = call(fa.generate, _gen_request(body=sample_pdf))
+    shown = call(fa.generate, _gen_request(body=sample_pdf, params={"includeRanks": "true"}))
     assert hidden.status_code == shown.status_code == 200
     h, s = (json.loads(r.get_body()) for r in (hidden, shown))
     assert storage.competitions[("GLOBAL", h["id"])]["IncludeRanks"] is False
@@ -97,6 +106,6 @@ def test_include_ranks_flag_is_persisted_and_changes_output(sample_pdf, storage)
 
 def test_storage_failure_is_a_500_not_a_leak(sample_pdf, monkeypatch):
     monkeypatch.setattr(fa, "get_blob_service_client", lambda: None)
-    resp = call(fa.generate, make_request("generate", body=sample_pdf))
+    resp = call(fa.generate, _gen_request(body=sample_pdf))
     assert resp.status_code == 500
     assert b"Storage configuration not found" in resp.get_body()

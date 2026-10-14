@@ -66,7 +66,10 @@ def test_delete_competition_removes_blobs_and_soft_deletes_row(storage):
     assert ("dddddddd", "per-skater.pdf") not in storage.papers
     row = storage.competitions[("GLOBAL", "dddddddd")]
     assert row["Visible"] is False
-    assert row["DeletedBy"] == "tester@example.com"
+    # The kept soft-deleted row holds no e-mail address: who deleted it is
+    # recorded only as "user", and the creator is blanked.
+    assert row["DeletedBy"] == fa.USER_DELETE_ACTOR
+    assert row["CreatedBy"] == ""
     assert _ISO_Z.match(row["DeletedDate"]), row["DeletedDate"]
     assert storage.competitions[("GLOBAL", "eeeeeeee")]["Visible"] is True
 
@@ -82,6 +85,8 @@ def test_auto_delete_sweep(storage):
     rows = storage.competitions
     assert rows[("GLOBAL", "11111111")]["Visible"] is False
     assert rows[("GLOBAL", "11111111")]["DeletedBy"] == fa.AUTO_CLEANUP_ACTOR
+    assert rows[("GLOBAL", "11111111")]["CreatedBy"] == ""
+    assert rows[("GLOBAL", "22222222")]["CreatedBy"] == "x@y"  # live rows keep their creator
     assert rows[("GLOBAL", "22222222")]["Visible"] is True
     assert rows[("GLOBAL", "44444444")]["Visible"] is False
     assert rows[("GLOBAL", "44444444")]["DeletionDate"] == fa.LEGACY_DELETION_DATE
@@ -89,6 +94,40 @@ def test_auto_delete_sweep(storage):
     assert any(b.startswith("Comp 22222222-22222222/") for b in storage.blobs)
     # The soft-deleted one was skipped: its blobs are left alone.
     assert any(b.startswith("Comp 33333333-33333333/") for b in storage.blobs)
+
+
+def test_sweep_scrubs_addresses_from_old_deleted_rows(storage):
+    """Rows soft-deleted before deletion started scrubbing still carry e-mail
+    addresses; the nightly run blanks them and leaves everything else alone."""
+    _seed(storage, "aaaaaaaa", days_from_now=10, visible=False)  # CreatedBy x@y
+    storage.competitions[("GLOBAL", "aaaaaaaa")]["DeletedBy"] = "old.user@example.com"
+    _seed(storage, "bbbbbbbb", days_from_now=10, visible=False)
+    storage.competitions[("GLOBAL", "bbbbbbbb")].update({"CreatedBy": "-", "DeletedBy": fa.AUTO_CLEANUP_ACTOR})
+    _seed(storage, "cccccccc", days_from_now=10, visible=False)
+    storage.competitions[("GLOBAL", "cccccccc")].update({"CreatedBy": "", "DeletedBy": fa.USER_DELETE_ACTOR})
+    _seed(storage, "dddddddd", days_from_now=10)  # live: creator kept
+
+    assert fa._scrub_hidden_rows(storage.table("competitions")) == 1
+    rows = storage.competitions
+    assert rows[("GLOBAL", "aaaaaaaa")]["CreatedBy"] == "" and rows[("GLOBAL", "aaaaaaaa")]["DeletedBy"] == ""
+    assert rows[("GLOBAL", "bbbbbbbb")]["CreatedBy"] == "-"
+    assert rows[("GLOBAL", "bbbbbbbb")]["DeletedBy"] == fa.AUTO_CLEANUP_ACTOR
+    assert rows[("GLOBAL", "cccccccc")]["DeletedBy"] == fa.USER_DELETE_ACTOR
+    assert rows[("GLOBAL", "dddddddd")]["CreatedBy"] == "x@y"
+    assert fa._scrub_hidden_rows(storage.table("competitions")) == 0  # idempotent
+
+    # ... and the timer runs it every night.
+    storage.competitions[("GLOBAL", "aaaaaaaa")]["CreatedBy"] = "again@example.com"
+    fa.auto_delete_expired_competitions._function.get_user_function()(timer=None)
+    assert rows[("GLOBAL", "aaaaaaaa")]["CreatedBy"] == ""
+
+
+def test_details_report_retention(storage):
+    _seed(storage, "aaaaaaaa", days_from_now=10)
+    body = json.loads(call(fa.get_competition_details, make_request(
+        "get_competition_details", method="GET", params={"id": "aaaaaaaa"})).get_body())
+    assert body["platformId"] is None
+    assert body["deletionDate"] == storage.competitions[("GLOBAL", "aaaaaaaa")]["DeletionDate"]
 
 
 def test_parse_iso_utc():
