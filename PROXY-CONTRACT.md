@@ -29,7 +29,9 @@ Both are defined in `infra/functions/function_app.py`.
   open, so local `func start` and a brief pre-rollout window keep working
   instead of locking everyone out.
 - A mismatch makes `get_user_email_from_header()` return `None`, which every
-  route turns into **401**.
+  route turns into **401** — except `GET health`, which needs neither identity
+  nor the secret: it answers `{"status": "ok", "service": "fs-scoremodifier"}`
+  without touching storage, for the site's admin diagnostics.
 
 ### `X-Forwarded-User-Email`
 
