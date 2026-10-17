@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import azure.functions as func
 import logging
+import hmac
 import os
-import base64
 import json
 import re
 
 import fitz  # PyMuPDF — used to derive the competition name and count output pages
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 from azure.identity import DefaultAzureCredential
@@ -23,6 +24,7 @@ from scoremodifier.results import render_results_pdf
 from scoremodifier.results_html import render_results_html
 from scoremodifier.index_meta import fetch_index_html, parse_index_html, match_category
 
+import platform_access
 from platform_clock import (
     PlatformClockUnavailable,
     get_platform_table_client,
@@ -39,6 +41,10 @@ CONTAINER_NAME = "fs-scoremodifier"
 
 # Maximum file upload size: 25 MB
 MAX_UPLOAD_SIZE = 25 * 1024 * 1024
+
+# Download links to generated files: a fresh read-only SAS per response,
+# minted after the access check and never stored.
+GENERATED_LINK_VALIDITY = timedelta(minutes=15)
 
 # Generated output filename (one per generation).
 OUTPUT_FILENAME = "per-skater.pdf"
@@ -96,96 +102,111 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def is_user_allowed(email: str) -> bool:
+def is_user_allowed(user: "User") -> bool:
     """
-    Check if the user is allowed to perform sensitive operations.
-    Policy for v1.0.0: All authenticated Entra ID users are allowed.
-    To restrict access, implement an allowlist here (e.g. from Table Storage or env var).
+    Check if the user is allowed to use the tool at all (before any
+    per-competition access check). All signed-in users are; hook for a future
+    allowlist.
     """
     return True
 
 
 def _proxy_secret_ok(req: func.HttpRequest) -> bool:
     """
-    Verify the request came from the Web App proxy by checking the shared
-    secret header. The function endpoint is public, so this prevents anyone
-    from spoofing the X-Forwarded-User-Email header directly.
+    Verify the request came from the router proxy by checking the shared
+    secret header. The function endpoint is public, so this is what makes the
+    x-forwarded-user-* identity headers trustworthy.
 
-    Enforced only when PROXY_SHARED_SECRET is set (so local dev and any
-    brief pre-rollout window fail open rather than locking everyone out).
+    Fails CLOSED: an unset/empty PROXY_SHARED_SECRET rejects every request
+    (local `func start` must set one too). Compared in constant time.
     """
-    expected = os.environ.get("PROXY_SHARED_SECRET")
+    expected = os.environ.get("PROXY_SHARED_SECRET") or ""
     if not expected:
-        return True
-    provided = req.headers.get("X-Proxy-Secret") or req.headers.get("x-proxy-secret")
-    return provided == expected
+        logging.error("PROXY_SHARED_SECRET is not set; rejecting request")
+        return False
+    provided = req.headers.get("x-proxy-secret") or ""
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
-def _decode_jwt_payload(token: str) -> dict | None:
-    """Decode the payload of a JWT token without verification (base64 only)."""
-    try:
-        parts = token.split('.')
-        if len(parts) != 3:
-            return None
-        payload_b64 = parts[1]
-        payload_b64 += '=' * (4 - len(payload_b64) % 4)
-        payload_bytes = base64.urlsafe_b64decode(payload_b64)
-        return json.loads(payload_bytes)
-    except Exception as e:
-        logging.error(f"Error decoding JWT payload: {e}")
-        return None
+@dataclass(frozen=True)
+class User:
+    """The signed-in caller, exactly as the router forwarded it.
 
-
-def get_user_email_from_header(req: func.HttpRequest) -> str | None:
+    ``tid``/``oid`` (lowercase Entra tenant + object id GUIDs) are the identity
+    every access decision uses; ``email``/``name`` are for display and the
+    CreatedBy history only, never for authorisation.
     """
-    Extracts the user email from the X-MS-CLIENT-PRINCIPAL header injected by
-    Azure App Service Auth, the X-Forwarded-User-Email header set by the Web App
-    proxy (server.js), or the Authorization Bearer JWT token.
+
+    tid: str
+    oid: str
+    email: str
+    name: str
+    is_admin: bool
+
+
+def get_user(req: func.HttpRequest) -> User | None:
     """
-    # 0. Reject requests that didn't come through the Web App proxy
+    The caller from the router's x-forwarded-user-* headers, or None (-> 401).
+
+    Identity comes ONLY from those headers, which the router sets and the
+    proxy secret makes trustworthy: no Easy Auth principal headers, no Bearer
+    tokens. A missing or non-GUID tid/oid is no identity at all.
+    """
     if not _proxy_secret_ok(req):
         logging.warning("Proxy shared secret missing or mismatched; rejecting request")
         return None
 
-    # 1. Direct Easy Auth header
-    val = req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME") or req.headers.get("x-ms-client-principal-name")
-    if val:
-        return val
+    tid = (req.headers.get("x-forwarded-user-tid") or "").strip().lower()
+    oid = (req.headers.get("x-forwarded-user-oid") or "").strip().lower()
+    if platform_access.identity_key(tid, oid) is None:
+        # Header names only: values can carry personal data (addresses, IPs).
+        logging.warning(f"No identity found. Request headers: {sorted(k.lower() for k in req.headers.keys())}")
+        return None
 
-    # 2. Forwarded header from Web App proxy (server.js)
-    forwarded = req.headers.get("X-Forwarded-User-Email") or req.headers.get("x-forwarded-user-email")
-    if forwarded:
-        return forwarded
+    email = (req.headers.get("x-forwarded-user-email") or "").strip().lower()
+    try:
+        name = unquote(req.headers.get("x-forwarded-user-name") or "").strip()
+    except Exception:
+        name = ""
+    is_admin = req.headers.get("x-forwarded-user-admin") == "1"
+    return User(tid=tid, oid=oid, email=email, name=name, is_admin=is_admin)
 
-    # 3. Base64 SWA principal header
-    header = req.headers.get("x-ms-client-principal") or req.headers.get("X-MS-CLIENT-PRINCIPAL")
-    if header:
-        try:
-            decoded = base64.b64decode(header).decode("utf-8")
-            principal = json.loads(decoded)
-            return principal.get("userDetails")
-        except Exception as e:
-            logging.error(f"Error parsing auth header: {e}")
 
-    # 4. Authorization Bearer token (JWT)
-    auth_header = req.headers.get("Authorization") or req.headers.get("authorization")
-    if auth_header and auth_header.lower().startswith("bearer "):
-        token = auth_header[7:]
-        claims = _decode_jwt_payload(token)
-        if claims:
-            email = claims.get("preferred_username") or claims.get("email") or claims.get("upn") or claims.get("unique_name")
-            if not email:
-                emails = claims.get("emails")
-                if isinstance(emails, list) and emails:
-                    email = emails[0]
-            if not email:
-                email = claims.get("name") or claims.get("oid")
-            if email:
-                return email
+def _role_for(user: User, platform_id, *, identities_client=None, access_client=None):
+    """The caller's role on a platform competition ("owner"/"write"/"read"/None).
 
-    # Header names only: values can carry personal data (addresses, IPs).
-    logging.warning(f"No Identity found. Request headers: {sorted(k.lower() for k in req.headers.keys())}")
-    return None
+    A missing or malformed PlatformId (legacy record) is admin-only. Raises
+    PlatformBindingError(503, platform_unavailable) when the platform access
+    tables cannot be read — never grants because of a read failure.
+    """
+    guid = normalize_platform_id(platform_id)
+    if guid is None:
+        return "owner" if user.is_admin else None
+    try:
+        return platform_access.role_for(
+            guid, user.tid, user.oid, is_admin=user.is_admin,
+            identities_client=identities_client, access_client=access_client,
+        )
+    except platform_access.PlatformAccessUnavailable:
+        logging.error("Platform access tables unavailable; request refused")
+        raise PlatformBindingError(503, "platform_unavailable")
+
+
+def _require_platform_access(user: User, platform_id, need: str) -> str:
+    """Require role ``need`` ("read"/"write"/"owner") on the platform competition.
+
+    No role (no grant, unknown competition or identity, legacy record for a
+    non-admin) -> 404 platform_not_found, so existence never leaks; anyone but
+    the owner (or an admin) on an owner route -> 403 platform_owner_required;
+    a read-only caller on a write route -> 403 platform_read_only; unreadable
+    access tables -> 503 platform_unavailable. Returns the role.
+    """
+    role = _role_for(user, platform_id)
+    if role is None:
+        raise PlatformBindingError(404, "platform_not_found")
+    if not platform_access.role_satisfies(role, need):
+        raise PlatformBindingError(403, "platform_owner_required" if need == "owner" else "platform_read_only")
+    return role
 
 
 # Liveness for the site's admin diagnostics: no sign-in, no secret, no storage
@@ -198,10 +219,10 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="check_user_permission", auth_level=func.AuthLevel.ANONYMOUS)
 def check_user_permission(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Checking user permission...')
-    email = get_user_email_from_header(req)
-    if not email:
+    user = get_user(req)
+    if not user:
         return func.HttpResponse(json.dumps({"allowed": False, "email": None}), mimetype="application/json", status_code=401)
-    return func.HttpResponse(json.dumps({"allowed": True, "email": email}), mimetype="application/json")
+    return func.HttpResponse(json.dumps({"allowed": True, "email": user.email or None}), mimetype="application/json")
 
 
 def get_blob_service_client():
@@ -380,78 +401,135 @@ def _sync_local_deletion_date(comp_table, entity, clock):
     return entity
 
 
-def create_and_store_sas_link(blob_service_client, container_name, blob_name, competition, filename, file_size=0, description="Per-skater scores (PDF)"):
-    """Create a 5-day read SAS for a generated blob, store it as a generatedpapers row, and return (url, expiry_iso)."""
+def _user_delegation_key(blob_service_client, start_time, expiry):
+    """The user-delegation key a managed identity signs read SASes with, or None
+    with a connection string (local dev signs with the account key). Fetched
+    once per response, not once per link."""
+    if os.environ.get("AzureWebJobsStorage__accountName"):
+        return blob_service_client.get_user_delegation_key(start_time, expiry)
+    return None
+
+
+def generate_blob_read_sas_url(blob_service_client, container_name, blob_name, start_time, expiry,
+                               user_delegation_key=None):
+    """Read-only SAS URL for one blob, valid from start_time to expiry, or None
+    when no credential can sign. Managed identity signs with a user-delegation
+    key (pass one in to reuse it), a connection string with the account key."""
+    sas_token = ""
+    account_name = blob_service_client.account_name
+    # Percent-encode the path (folder names keep spaces/special chars per
+    # sanitize_name). Without this the URL carries raw spaces, and a browser
+    # re-encoding the whole URL double-encodes the SAS query, which Azure
+    # rejects with "Signature fields not well formed". safe='/' keeps the path
+    # separators intact; the SAS token below is already encoded.
+    encoded_path = quote(f"{container_name}/{blob_name}", safe="/")
+    blob_url_base = f"https://{account_name}.blob.core.windows.net/{encoded_path}"
+
+    if os.environ.get("AzureWebJobsStorage__accountName"):
+        ud_key = user_delegation_key or blob_service_client.get_user_delegation_key(start_time, expiry)
+        sas_token = generate_blob_sas(
+            account_name=account_name,
+            container_name=container_name,
+            blob_name=blob_name,
+            user_delegation_key=ud_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=expiry,
+            start=start_time,
+        )
+    else:
+        conn_str = os.environ.get("AzureWebJobsStorage")
+        if conn_str:
+            items = dict(item.split('=', 1) for item in conn_str.split(';') if '=' in item)
+            key = items.get('AccountKey')
+            if key:
+                sas_token = generate_blob_sas(
+                    account_name=items.get('AccountName'),
+                    container_name=container_name,
+                    blob_name=blob_name,
+                    account_key=key,
+                    permission=BlobSasPermissions(read=True),
+                    expiry=expiry,
+                    start=start_time,
+                )
+
+    return f"{blob_url_base}?{sas_token}" if sas_token else None
+
+
+class _ReadLinks:
+    """Fresh read-only links for one response: every link shares one validity
+    window (GENERATED_LINK_VALIDITY from now, starting a few minutes back for
+    clock skew) and, under managed identity, one user-delegation key. Use only
+    after the caller's access check."""
+
+    def __init__(self, blob_service_client, now=None):
+        self.blob_service_client = blob_service_client
+        # Naive UTC whole seconds, like every timestamp this app stores (_utcnow).
+        now = (now or _utcnow()).replace(microsecond=0)
+        self.start = now - timedelta(minutes=5)
+        self.expiry = now + GENERATED_LINK_VALIDITY
+        self._ud_key = None
+        self._failed = False
+
+    def url(self, blob_name):
+        """(url, expiry_iso) for ``blob_name``, or (None, None)."""
+        if not blob_name or self._failed:
+            return None, None
+        try:
+            if self._ud_key is None:
+                self._ud_key = _user_delegation_key(self.blob_service_client, self.start, self.expiry)
+            url = generate_blob_read_sas_url(self.blob_service_client, CONTAINER_NAME, blob_name,
+                                             self.start, self.expiry, user_delegation_key=self._ud_key)
+        except Exception as e:
+            self._failed = True
+            logging.error(f"Could not sign download links: {type(e).__name__}")
+            return None, None
+        return (url, f"{self.expiry.isoformat()}Z") if url else (None, None)
+
+
+def store_generated_file(blob_name, competition, filename, file_size=0, description="Per-skater scores (PDF)"):
+    """Record a generated blob as a generatedpapers row: its blob name, never a
+    link (links are minted per response by _ReadLinks, after the access check).
+    Best effort, like the counters: the generation itself already succeeded."""
     try:
         table_client = get_table_client()
         if not table_client:
-            logging.warning("No table client available, skipping SAS creation")
-            return None, None
-
+            logging.warning("No table client available, generated file not recorded")
+            return
         try:
             table_client.create_table()
         except Exception:
             pass
-
-        start_time = _utcnow()
-        expiry = start_time + timedelta(days=5)
-        sas_token = ""
-
-        account_name = blob_service_client.account_name
-        # Percent-encode the path (folder names keep spaces/special chars per
-        # sanitize_name). Without this the stored URL carries raw spaces, and a
-        # browser re-encoding the whole URL double-encodes the SAS query, which
-        # Azure rejects with "Signature fields not well formed". safe='/' keeps
-        # the path separators intact; the SAS token below is already encoded.
-        encoded_path = quote(f"{container_name}/{blob_name}", safe="/")
-        blob_url_base = f"https://{account_name}.blob.core.windows.net/{encoded_path}"
-
-        if os.environ.get("AzureWebJobsStorage__accountName"):
-            ud_key = blob_service_client.get_user_delegation_key(start_time, expiry)
-            sas_token = generate_blob_sas(
-                account_name=account_name,
-                container_name=container_name,
-                blob_name=blob_name,
-                user_delegation_key=ud_key,
-                permission=BlobSasPermissions(read=True),
-                expiry=expiry,
-                start=start_time,
-            )
-        else:
-            conn_str = os.environ.get("AzureWebJobsStorage")
-            if conn_str:
-                items = dict(item.split('=', 1) for item in conn_str.split(';') if '=' in item)
-                key = items.get('AccountKey')
-                if key:
-                    sas_token = generate_blob_sas(
-                        account_name=items.get('AccountName'),
-                        container_name=container_name,
-                        blob_name=blob_name,
-                        account_key=key,
-                        permission=BlobSasPermissions(read=True),
-                        expiry=expiry,
-                        start=start_time,
-                    )
-
-        if not sas_token:
-            return None, None
-
-        full_url = f"{blob_url_base}?{sas_token}"
-        entity = {
+        table_client.upsert_entity({
             "PartitionKey": competition,
             "RowKey": filename.replace('/', '_').replace('\\', '_'),
-            "Url": full_url,
-            "ExpirationDate": expiry.isoformat(),
+            "BlobName": blob_name,
             "Description": description,
             "FileName": filename,
             "FileSize": int(file_size),
-        }
-        table_client.upsert_entity(entity)
-        logging.info(f"Stored SAS link for {filename}")
-        return full_url, expiry.isoformat()
+        }, mode=UpdateMode.REPLACE)
     except Exception as e:
-        logging.error(f"Error creating SAS: {e}")
-        return None, None
+        logging.error(f"Error recording generated file: {e}")
+
+
+def _generated_blob_name(paper, folder_path):
+    """The blob a generatedpapers row stands for, or None. Rows written before
+    BlobName existed stored a 5-day SAS URL instead: only the blob name is
+    taken from it (the URL itself is never returned again). The first
+    candidate inside the record's own output folder wins — BlobName, the old
+    URL's path, then ``<folder>/output/<FileName>`` — so a link never points
+    outside it."""
+    prefix = f"{folder_path.strip('/')}/output/"
+    candidates = [paper.get("BlobName")]
+    if paper.get("Url"):
+        path = unquote(urlparse(str(paper["Url"])).path).lstrip("/")
+        container_name, _, rest = path.partition("/")
+        candidates.append(rest if container_name == CONTAINER_NAME else None)
+    if paper.get("FileName"):
+        candidates.append(f"{prefix}{paper['FileName']}")
+    for blob_name in candidates:
+        if isinstance(blob_name, str) and blob_name.startswith(prefix) and blob_name != prefix:
+            return blob_name
+    return None
 
 
 def derive_name_and_meta(pdf_bytes: bytes):
@@ -485,19 +563,20 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
 
     Body = the PDF bytes. Query: includeRanks=true|false (default false -> hide
     non-podium ranks). Persists source + output in the tool's storage and a
-    generatedpapers SAS link; returns the download URL.
+    generatedpapers row (the blob name); returns a fresh 15-minute download URL.
     """
     logging.info('Generating per-skater PDF...')
 
-    email = get_user_email_from_header(req)
-    if not email:
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
-    if not is_user_allowed(email):
+    if not is_user_allowed(user):
         return func.HttpResponse("Forbidden: You are not on the allow list.", status_code=403)
 
     include_ranks = (req.params.get('includeRanks', 'false').lower() == 'true')
     try:
         platform_id = _platform_id_param(req)
+        _require_platform_access(user, platform_id, "write")
     except PlatformBindingError as e:
         return e.response()
 
@@ -568,7 +647,7 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
             "IncludeRanks": include_ranks,
             "OutputPages": pages,
             "Visible": True,
-            "CreatedBy": email,
+            "CreatedBy": user.email,
             "CreatedDate": f"{now.isoformat()}Z",
             "PlatformId": platform_id,
             "UploadedFileCount": 1,
@@ -577,9 +656,8 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
             **({"DeletionDate": deletion_date} if deletion_date else {}),
         })
 
-        download_url, expiration = create_and_store_sas_link(
-            blob_service_client, CONTAINER_NAME, out_blob, new_id, OUTPUT_FILENAME, len(output_bytes)
-        )
+        store_generated_file(out_blob, new_id, OUTPUT_FILENAME, len(output_bytes))
+        download_url, expiration = _ReadLinks(blob_service_client).url(out_blob)
 
         return func.HttpResponse(json.dumps({
             "id": new_id,
@@ -601,8 +679,7 @@ def parse_index(req: func.HttpRequest) -> func.HttpResponse:
     Returns competition name/date/venue and the category result pages
     (CAT###RS.htm). Fetching is restricted to INDEX_ALLOWED_HOSTS (SSRF guard).
     """
-    email = get_user_email_from_header(req)
-    if not email:
+    if not get_user(req):
         return func.HttpResponse("Unauthorized", status_code=401)
 
     url = req.params.get("url")
@@ -633,17 +710,18 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
     Body = the per-skater PDF. Query: competition, date, venue, category,
     supertitle, catFile, indexUrl (optional; fills blank fields + matches the
     CAT page). Produces a results PDF + a podium-only CAT###RS.htm, stores both,
-    and returns their download URLs.
+    and returns fresh 15-minute download URLs.
     """
     logging.info('Generating results summary...')
 
-    email = get_user_email_from_header(req)
-    if not email:
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
-    if not is_user_allowed(email):
+    if not is_user_allowed(user):
         return func.HttpResponse("Forbidden: You are not on the allow list.", status_code=403)
     try:
         platform_id = _platform_id_param(req)
+        _require_platform_access(user, platform_id, "write")
     except PlatformBindingError as e:
         return e.response()
 
@@ -726,8 +804,8 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
 
     # Download filename for the results PDF. Tulokkaat re-uses the standard FSM
     # export name; other categories default to a generic name but the operator
-    # can override it (pdfFile). The blob is named accordingly so the SAS link
-    # downloads with this filename.
+    # can override it (pdfFile). The blob is named accordingly so the download
+    # link serves this filename.
     default_pdf_filename = (
         TULOKKAAT_PDF_FILENAME
         if meta.category.strip().upper() == "TULOKKAAT"
@@ -774,7 +852,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
             "CatFile": html_filename,
             "OutputPages": 1,
             "Visible": True,
-            "CreatedBy": email,
+            "CreatedBy": user.email,
             "CreatedDate": f"{now.isoformat()}Z",
             "PlatformId": platform_id,
             "UploadedFileCount": 1,
@@ -783,14 +861,13 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
             **({"DeletionDate": deletion_date} if deletion_date else {}),
         })
 
-        download_url, expiration = create_and_store_sas_link(
-            blob_service_client, CONTAINER_NAME, pdf_blob, new_id, pdf_filename,
-            len(results_pdf), description="Results summary (PDF)",
-        )
-        html_url, _ = create_and_store_sas_link(
-            blob_service_client, CONTAINER_NAME, html_blob, new_id, html_filename,
-            len(results_html), description="Podium results page (HTML)",
-        )
+        store_generated_file(pdf_blob, new_id, pdf_filename, len(results_pdf),
+                             description="Results summary (PDF)")
+        store_generated_file(html_blob, new_id, html_filename, len(results_html),
+                             description="Podium results page (HTML)")
+        links = _ReadLinks(blob_service_client)
+        download_url, expiration = links.url(pdf_blob)
+        html_url, _ = links.url(html_blob)
 
         return func.HttpResponse(json.dumps({
             "id": new_id,
@@ -807,11 +884,59 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Error processing request. Check server logs for details.", status_code=500)
 
 
+def _load_competition_for(user: User, comp_id: str, need: str):
+    """The competitions row ``comp_id`` when the caller has ``need`` on its
+    platform competition. An unknown record answers exactly like one the caller
+    may not see (404 platform_not_found); see _require_platform_access."""
+    entity = get_competition_entity(comp_id)
+    if not entity:
+        raise PlatformBindingError(404, "platform_not_found")
+    _require_platform_access(user, entity.get("PlatformId"), need)
+    return entity
+
+
+def _readable_filter(user: User):
+    """A predicate PlatformId -> bool: may the caller read records bound to it?
+
+    Admins read everything (legacy rows without a PlatformId included). For
+    everyone else the platform access tables are read lazily — one client pair
+    per request, one lookup per distinct competition. Raises
+    PlatformBindingError(503) when they cannot be read.
+    """
+    if user.is_admin:
+        return lambda platform_id: True
+    clients: dict = {}
+    decided: dict = {}
+
+    def readable(platform_id) -> bool:
+        guid = normalize_platform_id(platform_id)
+        if guid is None:
+            return False
+        if guid not in decided:
+            if not clients:
+                try:
+                    clients["identities"] = platform_access.get_identities_table_client()
+                    clients["access"] = platform_access.get_access_table_client()
+                except platform_access.PlatformAccessUnavailable:
+                    logging.error("Platform access tables unavailable; list refused")
+                    raise PlatformBindingError(503, "platform_unavailable")
+                except Exception as exc:
+                    logging.error(f"Platform access client failed: {type(exc).__name__}")
+                    raise PlatformBindingError(503, "platform_unavailable")
+            role = _role_for(user, guid, identities_client=clients["identities"], access_client=clients["access"])
+            decided[guid] = platform_access.role_satisfies(role, "read")
+        return decided[guid]
+
+    return readable
+
+
 @app.route(route="list_competitions", auth_level=func.AuthLevel.ANONYMOUS)
 def list_competitions(req: func.HttpRequest) -> func.HttpResponse:
-    """List persisted competitions (history). Not yet used by the UI."""
-    email = get_user_email_from_header(req)
-    if not email:
+    """List persisted competitions (history) the caller may read: records whose
+    platform competition grants them at least read (admins: every record,
+    including legacy ones without a PlatformId). Not yet used by the UI."""
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
 
     try:
@@ -823,9 +948,12 @@ def list_competitions(req: func.HttpRequest) -> func.HttpResponse:
         except Exception:
             pass
 
+        readable = _readable_filter(user)
         competitions = []
         for entity in list(table_client.query_entities("PartitionKey eq 'GLOBAL'")):
             if entity.get("Visible") is False:
+                continue
+            if not readable(entity.get("PlatformId")):
                 continue
             _ensure_deletion_date(table_client, entity)
             competitions.append({
@@ -838,6 +966,8 @@ def list_competitions(req: func.HttpRequest) -> func.HttpResponse:
             })
 
         return func.HttpResponse(json.dumps(competitions), mimetype="application/json")
+    except PlatformBindingError as e:
+        return e.response()
     except Exception as e:
         logging.error(f"Error listing competitions: {e}")
         return func.HttpResponse(json.dumps({"error": "Internal server error"}), status_code=500, mimetype="application/json")
@@ -845,18 +975,21 @@ def list_competitions(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="get_competition_details", auth_level=func.AuthLevel.ANONYMOUS)
 def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
-    """Return a competition's stored fields + its generated-file links. Not yet used by the UI."""
-    email = get_user_email_from_header(req)
-    if not email:
+    """Return a competition's stored fields + its generated files, each with a
+    fresh 15-minute read link minted after the access check (read access on
+    its platform competition). Not yet used by the UI."""
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
 
     comp_id = req.params.get('id')
     if not comp_id:
         return func.HttpResponse("Missing id parameter", status_code=400)
 
-    entity = get_competition_entity(comp_id)
-    if not entity:
-        return func.HttpResponse("Competition not found", status_code=404)
+    try:
+        entity = _load_competition_for(user, comp_id, "read")
+    except PlatformBindingError as e:
+        return e.response()
     # Same effective legacy date as list_competitions and the sweep report.
     comp_table = get_table_client("competitions")
     if comp_table:
@@ -865,14 +998,19 @@ def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
     generated_links = []
     try:
         table_client = get_table_client()
-        if table_client:
+        blob_service_client = get_blob_service_client()
+        if table_client and blob_service_client:
+            links = _ReadLinks(blob_service_client)
+            folder_path = entity.get("FolderPath", comp_id)
             safe_pk = comp_id.replace("'", "''")
             for row in table_client.query_entities(f"PartitionKey eq '{safe_pk}'"):
+                # Never the row's stored Url (older rows hold a 5-day SAS).
+                url, expiration = links.url(_generated_blob_name(row, folder_path))
                 generated_links.append({
                     "fileName": row.get("FileName"),
-                    "url": row.get("Url"),
+                    "url": url,
                     "description": row.get("Description"),
-                    "expiration": row.get("ExpirationDate"),
+                    "expiration": expiration,
                     "size": row.get("FileSize"),
                 })
     except Exception as e:
@@ -960,21 +1098,40 @@ def _scrub_hidden_rows(comp_table) -> int:
     return scrubbed
 
 
-@app.route(route="delete_competition", auth_level=func.AuthLevel.ANONYMOUS)
+def _id_from_query_or_body(req: func.HttpRequest):
+    """``?id=`` or a JSON body {"id"}; None when neither carries a string."""
+    comp_id = req.params.get('id')
+    if not comp_id:
+        try:
+            body = req.get_json()
+        except ValueError:
+            body = None
+        comp_id = body.get('id') if isinstance(body, dict) else None
+    return comp_id if isinstance(comp_id, str) and comp_id else None
+
+
+@app.route(route="delete_competition", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
 def delete_competition(req: func.HttpRequest) -> func.HttpResponse:
-    """Delete a competition (blobs + rows). Not yet used by the UI."""
-    email = get_user_email_from_header(req)
-    if not email:
+    """Delete a competition record (blobs + rows). POST only, id from ``?id=``
+    or a JSON body {"id"}. Owner only on its platform competition (an admin
+    counts as owner): read/write callers get 403 platform_owner_required.
+    Not yet used by the UI."""
+    if req.method.upper() != "POST":
+        return func.HttpResponse("Method not allowed", status_code=405, headers={"Allow": "POST"})
+
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    comp_id = req.params.get('id')
+    comp_id = _id_from_query_or_body(req)
     if not comp_id:
         return func.HttpResponse("Missing id parameter", status_code=400)
 
     try:
-        entity = get_competition_entity(comp_id)
-        if not entity:
-            return func.HttpResponse("Competition not found", status_code=404)
+        entity = _load_competition_for(user, comp_id, "owner")
+    except PlatformBindingError as e:
+        return e.response()
+    try:
         count = _delete_competition_data(entity, USER_DELETE_ACTOR)
         return func.HttpResponse(json.dumps({"deleted": count}), mimetype="application/json")
     except Exception as e:

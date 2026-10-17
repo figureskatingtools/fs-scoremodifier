@@ -69,10 +69,14 @@ def test_results_without_index(team_sample_pdf, storage):
             assert t.name not in html
     assert segment in html  # caption falls back to the segment line
 
-    # Both files get SAS rows.
+    # Both files get generatedpapers rows (blob names, no links) and fresh links.
     assert {rk for (pk, rk) in storage.papers if pk == body["id"]} == {fa.RESULTS_PDF_FILENAME, "results.htm"}
-    assert body["downloadUrl"] == storage.papers[(body["id"], fa.RESULTS_PDF_FILENAME)]["Url"]
-    assert body["htmlUrl"] == storage.papers[(body["id"], "results.htm")]["Url"]
+    assert storage.papers[(body["id"], fa.RESULTS_PDF_FILENAME)]["BlobName"] == f"{folder}/output/{fa.RESULTS_PDF_FILENAME}"
+    assert storage.papers[(body["id"], "results.htm")]["BlobName"] == f"{folder}/output/results.htm"
+    assert not any("Url" in p for p in storage.papers.values())
+    assert body["downloadUrl"].split("?")[0].endswith(f"/output/{fa.RESULTS_PDF_FILENAME}")
+    assert body["htmlUrl"].split("?")[0].endswith("/output/results.htm")
+    assert "sig=" in body["downloadUrl"] and "sig=" in body["htmlUrl"]
 
 
 def test_tulokkaat_reuses_fsm_export_filename_and_cat_file(team_sample_pdf, storage):
