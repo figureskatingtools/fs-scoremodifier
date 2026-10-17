@@ -2,7 +2,8 @@
 
 import json
 import re
-from urllib.parse import urlparse
+from datetime import datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 from conftest import TEST_EMAIL, TEST_PLATFORM_ID, call, make_request, page_texts, rank_anchor_count, teams_or_none
 
@@ -78,15 +79,20 @@ def test_generate_happy_path(sample_pdf, storage):
     assert out[:5] == b"%PDF-"
     assert len(page_texts(out)) == expected_pages
 
-    # generatedpapers row: SAS link with a percent-encoded path.
+    # generatedpapers row: the blob name only, never a link.
     paper = storage.papers[(body["id"], fa.OUTPUT_FILENAME)]
-    assert paper["Url"] == body["downloadUrl"]
+    assert paper["BlobName"] == f"{folder}/output/{fa.OUTPUT_FILENAME}"
     assert paper["FileSize"] == len(out)
-    assert paper["ExpirationDate"] == body["expiration"]
+    assert "Url" not in paper and "ExpirationDate" not in paper
+    # The response carries a fresh 15-minute read SAS with a percent-encoded path.
     url = urlparse(body["downloadUrl"])
     assert url.hostname == f"{storage.blob_service.account_name}.blob.core.windows.net"
     assert " " not in url.path and url.path.startswith(f"/{fa.CONTAINER_NAME}/")
-    assert "sig=" in url.query and "se=" in url.query
+    query = parse_qs(url.query)
+    assert query["sp"] == ["r"] and "sig" in query
+    expiry = datetime.strptime(query["se"][0], "%Y-%m-%dT%H:%M:%SZ")
+    assert body["expiration"] == f"{expiry.isoformat()}Z"
+    assert timedelta(minutes=14) <= expiry - fa._utcnow() <= timedelta(minutes=16)
 
 
 def test_include_ranks_flag_is_persisted_and_changes_output(sample_pdf, storage):

@@ -72,7 +72,7 @@ everywhere without a lookup.
 | `POST generate?platformId=` | write on `platformId` |
 | `POST generate_results?platformId=` | write on `platformId` |
 | `GET get_competition_details?id=` | read on the record's `PlatformId` |
-| `delete_competition?id=` | write on the record's `PlatformId` |
+| `POST delete_competition` (id from `?id=` or JSON body `{"id"}`; other methods → 405) | **owner** on the record's `PlatformId` (admin counts as owner) |
 | `GET list_competitions` | lists only records whose `PlatformId` the caller can read (admin: all) |
 | `GET parse_index?url=`, `check_user_permission` | sign-in only (no competition) |
 | `GET health` | nothing |
@@ -83,7 +83,13 @@ Records without a (valid) `PlatformId` are legacy rows: **admin only**.
 |---|---|
 | No role: no grant, unknown platform competition or identity, unknown record id, legacy record for a non-admin | 404 `{"error": "platform_not_found"}` — existence is never revealed |
 | Read-only caller on a write route | 403 `{"error": "platform_read_only"}` |
+| Read or write caller on an owner route | 403 `{"error": "platform_owner_required"}` |
 | Access tables unreadable (`PLATFORM_STORAGE_ACCOUNT` unset, table missing, RBAC, network) | 503 `{"error": "platform_unavailable"}` |
+
+Download links (`downloadUrl`/`htmlUrl` from the generators,
+`generatedFiles[].url` from `get_competition_details`) are read-only SAS URLs
+minted fresh for each response, after the access check, and valid 15 minutes
+(`expiration`); none is stored.
 
 The access check runs right after `platformId` validation (400
 `platform_id_required`) and before the upload is read; the retention-clock

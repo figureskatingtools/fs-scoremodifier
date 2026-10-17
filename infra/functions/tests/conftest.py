@@ -7,7 +7,7 @@ so both directories go on ``sys.path`` the same way.
 Storage is replaced by dict-backed fakes exposing just the surface
 ``function_app`` uses (blob container upload/list/delete, table
 get/create/upsert/update/delete/query). ``AzureWebJobsStorage`` is set to a
-dummy connection string so ``create_and_store_sas_link`` takes the account-key
+dummy connection string so ``generate_blob_read_sas_url`` takes the account-key
 branch and runs the real ``generate_blob_sas`` with no network.
 
 Every request carries the router's headers by default (``make_request``): the
@@ -135,7 +135,7 @@ class FakeTableClient:
             raise ResourceExistsError(str(k))
         self.rows[k] = dict(entity)
 
-    def upsert_entity(self, entity):
+    def upsert_entity(self, entity, mode=None):
         self.rows[self._key(entity)] = dict(entity)
 
     def update_entity(self, entity, mode=None):

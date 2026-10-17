@@ -1,10 +1,11 @@
 """Competition access (ACCESS-CONTRACT / platform_access.py): every route that
 touches a competition asks the platform which role the caller has.
 
-generate / generate_results / delete_competition need write,
-get_competition_details / list_competitions need read, parse_index only a
-sign-in. No role -> 404 platform_not_found, read on a write route -> 403
-platform_read_only, unreadable access tables -> 503 platform_unavailable.
+generate / generate_results need write, delete_competition (POST only) needs
+owner, get_competition_details / list_competitions need read, parse_index only
+a sign-in. No role -> 404 platform_not_found, read on a write route -> 403
+platform_read_only, read/write on an owner route -> 403
+platform_owner_required, unreadable access tables -> 503 platform_unavailable.
 Records without a PlatformId (legacy) are admin-only.
 """
 
@@ -225,20 +226,59 @@ def test_details_access_unreadable_is_503(access, storage):
     assert _error(resp) == {"error": "platform_unavailable"}
 
 
-def test_delete_needs_write(strict, storage):
+@pytest.mark.parametrize("role", ["read", "write"])
+def test_delete_needs_owner(role, strict, storage):
     folder = _seed(storage, "aaaaaaaa", GUID)
-    strict.grant(GUID, "read")
+    strict.grant(GUID, role)
     resp = _delete("aaaaaaaa")
     assert resp.status_code == 403
-    assert _error(resp) == {"error": "platform_read_only"}
+    assert _error(resp) == {"error": "platform_owner_required"}
     assert storage.competitions[("GLOBAL", "aaaaaaaa")]["Visible"] is True
     assert f"{folder}/source.pdf" in storage.blobs
 
-    strict.grant(GUID, "write")
+    strict.grant(GUID, "owner")
     platform_access.clear_cache()
     assert _delete("aaaaaaaa").status_code == 200
     assert storage.competitions[("GLOBAL", "aaaaaaaa")]["Visible"] is False
     assert f"{folder}/source.pdf" not in storage.blobs
+
+
+def test_admin_deletes_without_a_grant(strict, storage):
+    _seed(storage, "aaaaaaaa", GUID)
+    assert _delete("aaaaaaaa", admin=True, oid=STRANGER_OID).status_code == 200
+    assert storage.competitions[("GLOBAL", "aaaaaaaa")]["Visible"] is False
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE", "PUT"])
+def test_delete_is_post_only(method, storage):
+    folder = _seed(storage, "aaaaaaaa", GUID)
+    resp = call(fa.delete_competition, make_request("delete_competition", method=method, params={"id": "aaaaaaaa"}))
+    assert resp.status_code == 405
+    assert resp.headers["Allow"] == "POST"
+    assert storage.competitions[("GLOBAL", "aaaaaaaa")]["Visible"] is True
+    assert f"{folder}/source.pdf" in storage.blobs
+
+
+def test_delete_route_declares_post_only():
+    bindings = fa.delete_competition._function.get_bindings_dict()["bindings"]
+    (trigger,) = [b for b in bindings if b.get("type") == "httpTrigger"]
+    assert [str(getattr(m, "value", m)).upper() for m in trigger["methods"]] == ["POST"]
+
+
+def test_delete_takes_the_id_from_a_json_body(storage):
+    _seed(storage, "aaaaaaaa", GUID)
+    resp = call(fa.delete_competition, make_request(
+        "delete_competition", body=json.dumps({"id": "aaaaaaaa"}).encode(),
+        headers={"content-type": "application/json"}))
+    assert resp.status_code == 200, resp.get_body()
+    assert storage.competitions[("GLOBAL", "aaaaaaaa")]["Visible"] is False
+
+
+@pytest.mark.parametrize("body", [b"", b"{}", b'{"id": ""}', b'{"id": 5}', b'["x"]', b"not json"])
+def test_delete_without_an_id_is_400(body, storage):
+    _seed(storage, "aaaaaaaa", GUID)
+    assert call(fa.delete_competition, make_request("delete_competition", body=body)).status_code == 400
+    assert storage.competitions[("GLOBAL", "aaaaaaaa")]["Visible"] is True
 
 
 def test_delete_without_access_is_404(strict, storage):

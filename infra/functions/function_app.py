@@ -10,7 +10,7 @@ import re
 import fitz  # PyMuPDF — used to derive the competition name and count output pages
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 from azure.identity import DefaultAzureCredential
@@ -41,6 +41,10 @@ CONTAINER_NAME = "fs-scoremodifier"
 
 # Maximum file upload size: 25 MB
 MAX_UPLOAD_SIZE = 25 * 1024 * 1024
+
+# Download links to generated files: a fresh read-only SAS per response,
+# minted after the access check and never stored.
+GENERATED_LINK_VALIDITY = timedelta(minutes=15)
 
 # Generated output filename (one per generation).
 OUTPUT_FILENAME = "per-skater.pdf"
@@ -189,18 +193,19 @@ def _role_for(user: User, platform_id, *, identities_client=None, access_client=
 
 
 def _require_platform_access(user: User, platform_id, need: str) -> str:
-    """Require role ``need`` ("read"/"write") on the platform competition.
+    """Require role ``need`` ("read"/"write"/"owner") on the platform competition.
 
     No role (no grant, unknown competition or identity, legacy record for a
-    non-admin) -> 404 platform_not_found, so existence never leaks; a read-only
-    caller on a write route -> 403 platform_read_only; unreadable access tables
-    -> 503 platform_unavailable. Returns the role.
+    non-admin) -> 404 platform_not_found, so existence never leaks; anyone but
+    the owner (or an admin) on an owner route -> 403 platform_owner_required;
+    a read-only caller on a write route -> 403 platform_read_only; unreadable
+    access tables -> 503 platform_unavailable. Returns the role.
     """
     role = _role_for(user, platform_id)
     if role is None:
         raise PlatformBindingError(404, "platform_not_found")
     if not platform_access.role_satisfies(role, need):
-        raise PlatformBindingError(403, "platform_read_only")
+        raise PlatformBindingError(403, "platform_owner_required" if need == "owner" else "platform_read_only")
     return role
 
 
@@ -396,78 +401,135 @@ def _sync_local_deletion_date(comp_table, entity, clock):
     return entity
 
 
-def create_and_store_sas_link(blob_service_client, container_name, blob_name, competition, filename, file_size=0, description="Per-skater scores (PDF)"):
-    """Create a 5-day read SAS for a generated blob, store it as a generatedpapers row, and return (url, expiry_iso)."""
+def _user_delegation_key(blob_service_client, start_time, expiry):
+    """The user-delegation key a managed identity signs read SASes with, or None
+    with a connection string (local dev signs with the account key). Fetched
+    once per response, not once per link."""
+    if os.environ.get("AzureWebJobsStorage__accountName"):
+        return blob_service_client.get_user_delegation_key(start_time, expiry)
+    return None
+
+
+def generate_blob_read_sas_url(blob_service_client, container_name, blob_name, start_time, expiry,
+                               user_delegation_key=None):
+    """Read-only SAS URL for one blob, valid from start_time to expiry, or None
+    when no credential can sign. Managed identity signs with a user-delegation
+    key (pass one in to reuse it), a connection string with the account key."""
+    sas_token = ""
+    account_name = blob_service_client.account_name
+    # Percent-encode the path (folder names keep spaces/special chars per
+    # sanitize_name). Without this the URL carries raw spaces, and a browser
+    # re-encoding the whole URL double-encodes the SAS query, which Azure
+    # rejects with "Signature fields not well formed". safe='/' keeps the path
+    # separators intact; the SAS token below is already encoded.
+    encoded_path = quote(f"{container_name}/{blob_name}", safe="/")
+    blob_url_base = f"https://{account_name}.blob.core.windows.net/{encoded_path}"
+
+    if os.environ.get("AzureWebJobsStorage__accountName"):
+        ud_key = user_delegation_key or blob_service_client.get_user_delegation_key(start_time, expiry)
+        sas_token = generate_blob_sas(
+            account_name=account_name,
+            container_name=container_name,
+            blob_name=blob_name,
+            user_delegation_key=ud_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=expiry,
+            start=start_time,
+        )
+    else:
+        conn_str = os.environ.get("AzureWebJobsStorage")
+        if conn_str:
+            items = dict(item.split('=', 1) for item in conn_str.split(';') if '=' in item)
+            key = items.get('AccountKey')
+            if key:
+                sas_token = generate_blob_sas(
+                    account_name=items.get('AccountName'),
+                    container_name=container_name,
+                    blob_name=blob_name,
+                    account_key=key,
+                    permission=BlobSasPermissions(read=True),
+                    expiry=expiry,
+                    start=start_time,
+                )
+
+    return f"{blob_url_base}?{sas_token}" if sas_token else None
+
+
+class _ReadLinks:
+    """Fresh read-only links for one response: every link shares one validity
+    window (GENERATED_LINK_VALIDITY from now, starting a few minutes back for
+    clock skew) and, under managed identity, one user-delegation key. Use only
+    after the caller's access check."""
+
+    def __init__(self, blob_service_client, now=None):
+        self.blob_service_client = blob_service_client
+        # Naive UTC whole seconds, like every timestamp this app stores (_utcnow).
+        now = (now or _utcnow()).replace(microsecond=0)
+        self.start = now - timedelta(minutes=5)
+        self.expiry = now + GENERATED_LINK_VALIDITY
+        self._ud_key = None
+        self._failed = False
+
+    def url(self, blob_name):
+        """(url, expiry_iso) for ``blob_name``, or (None, None)."""
+        if not blob_name or self._failed:
+            return None, None
+        try:
+            if self._ud_key is None:
+                self._ud_key = _user_delegation_key(self.blob_service_client, self.start, self.expiry)
+            url = generate_blob_read_sas_url(self.blob_service_client, CONTAINER_NAME, blob_name,
+                                             self.start, self.expiry, user_delegation_key=self._ud_key)
+        except Exception as e:
+            self._failed = True
+            logging.error(f"Could not sign download links: {type(e).__name__}")
+            return None, None
+        return (url, f"{self.expiry.isoformat()}Z") if url else (None, None)
+
+
+def store_generated_file(blob_name, competition, filename, file_size=0, description="Per-skater scores (PDF)"):
+    """Record a generated blob as a generatedpapers row: its blob name, never a
+    link (links are minted per response by _ReadLinks, after the access check).
+    Best effort, like the counters: the generation itself already succeeded."""
     try:
         table_client = get_table_client()
         if not table_client:
-            logging.warning("No table client available, skipping SAS creation")
-            return None, None
-
+            logging.warning("No table client available, generated file not recorded")
+            return
         try:
             table_client.create_table()
         except Exception:
             pass
-
-        start_time = _utcnow()
-        expiry = start_time + timedelta(days=5)
-        sas_token = ""
-
-        account_name = blob_service_client.account_name
-        # Percent-encode the path (folder names keep spaces/special chars per
-        # sanitize_name). Without this the stored URL carries raw spaces, and a
-        # browser re-encoding the whole URL double-encodes the SAS query, which
-        # Azure rejects with "Signature fields not well formed". safe='/' keeps
-        # the path separators intact; the SAS token below is already encoded.
-        encoded_path = quote(f"{container_name}/{blob_name}", safe="/")
-        blob_url_base = f"https://{account_name}.blob.core.windows.net/{encoded_path}"
-
-        if os.environ.get("AzureWebJobsStorage__accountName"):
-            ud_key = blob_service_client.get_user_delegation_key(start_time, expiry)
-            sas_token = generate_blob_sas(
-                account_name=account_name,
-                container_name=container_name,
-                blob_name=blob_name,
-                user_delegation_key=ud_key,
-                permission=BlobSasPermissions(read=True),
-                expiry=expiry,
-                start=start_time,
-            )
-        else:
-            conn_str = os.environ.get("AzureWebJobsStorage")
-            if conn_str:
-                items = dict(item.split('=', 1) for item in conn_str.split(';') if '=' in item)
-                key = items.get('AccountKey')
-                if key:
-                    sas_token = generate_blob_sas(
-                        account_name=items.get('AccountName'),
-                        container_name=container_name,
-                        blob_name=blob_name,
-                        account_key=key,
-                        permission=BlobSasPermissions(read=True),
-                        expiry=expiry,
-                        start=start_time,
-                    )
-
-        if not sas_token:
-            return None, None
-
-        full_url = f"{blob_url_base}?{sas_token}"
-        entity = {
+        table_client.upsert_entity({
             "PartitionKey": competition,
             "RowKey": filename.replace('/', '_').replace('\\', '_'),
-            "Url": full_url,
-            "ExpirationDate": expiry.isoformat(),
+            "BlobName": blob_name,
             "Description": description,
             "FileName": filename,
             "FileSize": int(file_size),
-        }
-        table_client.upsert_entity(entity)
-        logging.info(f"Stored SAS link for {filename}")
-        return full_url, expiry.isoformat()
+        }, mode=UpdateMode.REPLACE)
     except Exception as e:
-        logging.error(f"Error creating SAS: {e}")
-        return None, None
+        logging.error(f"Error recording generated file: {e}")
+
+
+def _generated_blob_name(paper, folder_path):
+    """The blob a generatedpapers row stands for, or None. Rows written before
+    BlobName existed stored a 5-day SAS URL instead: only the blob name is
+    taken from it (the URL itself is never returned again). The first
+    candidate inside the record's own output folder wins — BlobName, the old
+    URL's path, then ``<folder>/output/<FileName>`` — so a link never points
+    outside it."""
+    prefix = f"{folder_path.strip('/')}/output/"
+    candidates = [paper.get("BlobName")]
+    if paper.get("Url"):
+        path = unquote(urlparse(str(paper["Url"])).path).lstrip("/")
+        container_name, _, rest = path.partition("/")
+        candidates.append(rest if container_name == CONTAINER_NAME else None)
+    if paper.get("FileName"):
+        candidates.append(f"{prefix}{paper['FileName']}")
+    for blob_name in candidates:
+        if isinstance(blob_name, str) and blob_name.startswith(prefix) and blob_name != prefix:
+            return blob_name
+    return None
 
 
 def derive_name_and_meta(pdf_bytes: bytes):
@@ -501,7 +563,7 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
 
     Body = the PDF bytes. Query: includeRanks=true|false (default false -> hide
     non-podium ranks). Persists source + output in the tool's storage and a
-    generatedpapers SAS link; returns the download URL.
+    generatedpapers row (the blob name); returns a fresh 15-minute download URL.
     """
     logging.info('Generating per-skater PDF...')
 
@@ -594,9 +656,8 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
             **({"DeletionDate": deletion_date} if deletion_date else {}),
         })
 
-        download_url, expiration = create_and_store_sas_link(
-            blob_service_client, CONTAINER_NAME, out_blob, new_id, OUTPUT_FILENAME, len(output_bytes)
-        )
+        store_generated_file(out_blob, new_id, OUTPUT_FILENAME, len(output_bytes))
+        download_url, expiration = _ReadLinks(blob_service_client).url(out_blob)
 
         return func.HttpResponse(json.dumps({
             "id": new_id,
@@ -649,7 +710,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
     Body = the per-skater PDF. Query: competition, date, venue, category,
     supertitle, catFile, indexUrl (optional; fills blank fields + matches the
     CAT page). Produces a results PDF + a podium-only CAT###RS.htm, stores both,
-    and returns their download URLs.
+    and returns fresh 15-minute download URLs.
     """
     logging.info('Generating results summary...')
 
@@ -743,8 +804,8 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
 
     # Download filename for the results PDF. Tulokkaat re-uses the standard FSM
     # export name; other categories default to a generic name but the operator
-    # can override it (pdfFile). The blob is named accordingly so the SAS link
-    # downloads with this filename.
+    # can override it (pdfFile). The blob is named accordingly so the download
+    # link serves this filename.
     default_pdf_filename = (
         TULOKKAAT_PDF_FILENAME
         if meta.category.strip().upper() == "TULOKKAAT"
@@ -800,14 +861,13 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
             **({"DeletionDate": deletion_date} if deletion_date else {}),
         })
 
-        download_url, expiration = create_and_store_sas_link(
-            blob_service_client, CONTAINER_NAME, pdf_blob, new_id, pdf_filename,
-            len(results_pdf), description="Results summary (PDF)",
-        )
-        html_url, _ = create_and_store_sas_link(
-            blob_service_client, CONTAINER_NAME, html_blob, new_id, html_filename,
-            len(results_html), description="Podium results page (HTML)",
-        )
+        store_generated_file(pdf_blob, new_id, pdf_filename, len(results_pdf),
+                             description="Results summary (PDF)")
+        store_generated_file(html_blob, new_id, html_filename, len(results_html),
+                             description="Podium results page (HTML)")
+        links = _ReadLinks(blob_service_client)
+        download_url, expiration = links.url(pdf_blob)
+        html_url, _ = links.url(html_blob)
 
         return func.HttpResponse(json.dumps({
             "id": new_id,
@@ -915,8 +975,9 @@ def list_competitions(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="get_competition_details", auth_level=func.AuthLevel.ANONYMOUS)
 def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
-    """Return a competition's stored fields + its generated-file links (read
-    access on its platform competition). Not yet used by the UI."""
+    """Return a competition's stored fields + its generated files, each with a
+    fresh 15-minute read link minted after the access check (read access on
+    its platform competition). Not yet used by the UI."""
     user = get_user(req)
     if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
@@ -937,14 +998,19 @@ def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
     generated_links = []
     try:
         table_client = get_table_client()
-        if table_client:
+        blob_service_client = get_blob_service_client()
+        if table_client and blob_service_client:
+            links = _ReadLinks(blob_service_client)
+            folder_path = entity.get("FolderPath", comp_id)
             safe_pk = comp_id.replace("'", "''")
             for row in table_client.query_entities(f"PartitionKey eq '{safe_pk}'"):
+                # Never the row's stored Url (older rows hold a 5-day SAS).
+                url, expiration = links.url(_generated_blob_name(row, folder_path))
                 generated_links.append({
                     "fileName": row.get("FileName"),
-                    "url": row.get("Url"),
+                    "url": url,
                     "description": row.get("Description"),
-                    "expiration": row.get("ExpirationDate"),
+                    "expiration": expiration,
                     "size": row.get("FileSize"),
                 })
     except Exception as e:
@@ -1032,20 +1098,37 @@ def _scrub_hidden_rows(comp_table) -> int:
     return scrubbed
 
 
-@app.route(route="delete_competition", auth_level=func.AuthLevel.ANONYMOUS)
+def _id_from_query_or_body(req: func.HttpRequest):
+    """``?id=`` or a JSON body {"id"}; None when neither carries a string."""
+    comp_id = req.params.get('id')
+    if not comp_id:
+        try:
+            body = req.get_json()
+        except ValueError:
+            body = None
+        comp_id = body.get('id') if isinstance(body, dict) else None
+    return comp_id if isinstance(comp_id, str) and comp_id else None
+
+
+@app.route(route="delete_competition", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
 def delete_competition(req: func.HttpRequest) -> func.HttpResponse:
-    """Delete a competition (blobs + rows); write access on its platform
-    competition. Not yet used by the UI."""
+    """Delete a competition record (blobs + rows). POST only, id from ``?id=``
+    or a JSON body {"id"}. Owner only on its platform competition (an admin
+    counts as owner): read/write callers get 403 platform_owner_required.
+    Not yet used by the UI."""
+    if req.method.upper() != "POST":
+        return func.HttpResponse("Method not allowed", status_code=405, headers={"Allow": "POST"})
+
     user = get_user(req)
     if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
 
-    comp_id = req.params.get('id')
+    comp_id = _id_from_query_or_body(req)
     if not comp_id:
         return func.HttpResponse("Missing id parameter", status_code=400)
 
     try:
-        entity = _load_competition_for(user, comp_id, "write")
+        entity = _load_competition_for(user, comp_id, "owner")
     except PlatformBindingError as e:
         return e.response()
     try:

@@ -54,6 +54,8 @@ def test_list_and_details(storage):
     assert resp.status_code == 200
     assert body["name"] == "Comp aaaaaaaa"
     assert [f["fileName"] for f in body["generatedFiles"]] == ["per-skater.pdf"]
+    # A fresh link to the blob, never the row's stored Url ("u").
+    assert body["generatedFiles"][0]["url"].split("?")[0].endswith("/Comp%20aaaaaaaa-aaaaaaaa/output/per-skater.pdf")
     assert call(fa.get_competition_details, admin_request("get_competition_details", method="GET", params={"id": "nope"})).status_code == 404
     assert call(fa.get_competition_details, admin_request("get_competition_details", method="GET")).status_code == 400
 
