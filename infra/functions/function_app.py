@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import azure.functions as func
 import logging
+import hmac
 import os
-import base64
 import json
 import re
 
 import fitz  # PyMuPDF — used to derive the competition name and count output pages
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from uuid import uuid4
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 from azure.identity import DefaultAzureCredential
@@ -23,6 +24,7 @@ from scoremodifier.results import render_results_pdf
 from scoremodifier.results_html import render_results_html
 from scoremodifier.index_meta import fetch_index_html, parse_index_html, match_category
 
+import platform_access
 from platform_clock import (
     PlatformClockUnavailable,
     get_platform_table_client,
@@ -96,96 +98,110 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def is_user_allowed(email: str) -> bool:
+def is_user_allowed(user: "User") -> bool:
     """
-    Check if the user is allowed to perform sensitive operations.
-    Policy for v1.0.0: All authenticated Entra ID users are allowed.
-    To restrict access, implement an allowlist here (e.g. from Table Storage or env var).
+    Check if the user is allowed to use the tool at all (before any
+    per-competition access check). All signed-in users are; hook for a future
+    allowlist.
     """
     return True
 
 
 def _proxy_secret_ok(req: func.HttpRequest) -> bool:
     """
-    Verify the request came from the Web App proxy by checking the shared
-    secret header. The function endpoint is public, so this prevents anyone
-    from spoofing the X-Forwarded-User-Email header directly.
+    Verify the request came from the router proxy by checking the shared
+    secret header. The function endpoint is public, so this is what makes the
+    x-forwarded-user-* identity headers trustworthy.
 
-    Enforced only when PROXY_SHARED_SECRET is set (so local dev and any
-    brief pre-rollout window fail open rather than locking everyone out).
+    Fails CLOSED: an unset/empty PROXY_SHARED_SECRET rejects every request
+    (local `func start` must set one too). Compared in constant time.
     """
-    expected = os.environ.get("PROXY_SHARED_SECRET")
+    expected = os.environ.get("PROXY_SHARED_SECRET") or ""
     if not expected:
-        return True
-    provided = req.headers.get("X-Proxy-Secret") or req.headers.get("x-proxy-secret")
-    return provided == expected
+        logging.error("PROXY_SHARED_SECRET is not set; rejecting request")
+        return False
+    provided = req.headers.get("x-proxy-secret") or ""
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
-def _decode_jwt_payload(token: str) -> dict | None:
-    """Decode the payload of a JWT token without verification (base64 only)."""
-    try:
-        parts = token.split('.')
-        if len(parts) != 3:
-            return None
-        payload_b64 = parts[1]
-        payload_b64 += '=' * (4 - len(payload_b64) % 4)
-        payload_bytes = base64.urlsafe_b64decode(payload_b64)
-        return json.loads(payload_bytes)
-    except Exception as e:
-        logging.error(f"Error decoding JWT payload: {e}")
-        return None
+@dataclass(frozen=True)
+class User:
+    """The signed-in caller, exactly as the router forwarded it.
 
-
-def get_user_email_from_header(req: func.HttpRequest) -> str | None:
+    ``tid``/``oid`` (lowercase Entra tenant + object id GUIDs) are the identity
+    every access decision uses; ``email``/``name`` are for display and the
+    CreatedBy history only, never for authorisation.
     """
-    Extracts the user email from the X-MS-CLIENT-PRINCIPAL header injected by
-    Azure App Service Auth, the X-Forwarded-User-Email header set by the Web App
-    proxy (server.js), or the Authorization Bearer JWT token.
+
+    tid: str
+    oid: str
+    email: str
+    name: str
+    is_admin: bool
+
+
+def get_user(req: func.HttpRequest) -> User | None:
     """
-    # 0. Reject requests that didn't come through the Web App proxy
+    The caller from the router's x-forwarded-user-* headers, or None (-> 401).
+
+    Identity comes ONLY from those headers, which the router sets and the
+    proxy secret makes trustworthy: no Easy Auth principal headers, no Bearer
+    tokens. A missing or non-GUID tid/oid is no identity at all.
+    """
     if not _proxy_secret_ok(req):
         logging.warning("Proxy shared secret missing or mismatched; rejecting request")
         return None
 
-    # 1. Direct Easy Auth header
-    val = req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME") or req.headers.get("x-ms-client-principal-name")
-    if val:
-        return val
+    tid = (req.headers.get("x-forwarded-user-tid") or "").strip().lower()
+    oid = (req.headers.get("x-forwarded-user-oid") or "").strip().lower()
+    if platform_access.identity_key(tid, oid) is None:
+        # Header names only: values can carry personal data (addresses, IPs).
+        logging.warning(f"No identity found. Request headers: {sorted(k.lower() for k in req.headers.keys())}")
+        return None
 
-    # 2. Forwarded header from Web App proxy (server.js)
-    forwarded = req.headers.get("X-Forwarded-User-Email") or req.headers.get("x-forwarded-user-email")
-    if forwarded:
-        return forwarded
+    email = (req.headers.get("x-forwarded-user-email") or "").strip().lower()
+    try:
+        name = unquote(req.headers.get("x-forwarded-user-name") or "").strip()
+    except Exception:
+        name = ""
+    is_admin = req.headers.get("x-forwarded-user-admin") == "1"
+    return User(tid=tid, oid=oid, email=email, name=name, is_admin=is_admin)
 
-    # 3. Base64 SWA principal header
-    header = req.headers.get("x-ms-client-principal") or req.headers.get("X-MS-CLIENT-PRINCIPAL")
-    if header:
-        try:
-            decoded = base64.b64decode(header).decode("utf-8")
-            principal = json.loads(decoded)
-            return principal.get("userDetails")
-        except Exception as e:
-            logging.error(f"Error parsing auth header: {e}")
 
-    # 4. Authorization Bearer token (JWT)
-    auth_header = req.headers.get("Authorization") or req.headers.get("authorization")
-    if auth_header and auth_header.lower().startswith("bearer "):
-        token = auth_header[7:]
-        claims = _decode_jwt_payload(token)
-        if claims:
-            email = claims.get("preferred_username") or claims.get("email") or claims.get("upn") or claims.get("unique_name")
-            if not email:
-                emails = claims.get("emails")
-                if isinstance(emails, list) and emails:
-                    email = emails[0]
-            if not email:
-                email = claims.get("name") or claims.get("oid")
-            if email:
-                return email
+def _role_for(user: User, platform_id, *, identities_client=None, access_client=None):
+    """The caller's role on a platform competition ("owner"/"write"/"read"/None).
 
-    # Header names only: values can carry personal data (addresses, IPs).
-    logging.warning(f"No Identity found. Request headers: {sorted(k.lower() for k in req.headers.keys())}")
-    return None
+    A missing or malformed PlatformId (legacy record) is admin-only. Raises
+    PlatformBindingError(503, platform_unavailable) when the platform access
+    tables cannot be read — never grants because of a read failure.
+    """
+    guid = normalize_platform_id(platform_id)
+    if guid is None:
+        return "owner" if user.is_admin else None
+    try:
+        return platform_access.role_for(
+            guid, user.tid, user.oid, is_admin=user.is_admin,
+            identities_client=identities_client, access_client=access_client,
+        )
+    except platform_access.PlatformAccessUnavailable:
+        logging.error("Platform access tables unavailable; request refused")
+        raise PlatformBindingError(503, "platform_unavailable")
+
+
+def _require_platform_access(user: User, platform_id, need: str) -> str:
+    """Require role ``need`` ("read"/"write") on the platform competition.
+
+    No role (no grant, unknown competition or identity, legacy record for a
+    non-admin) -> 404 platform_not_found, so existence never leaks; a read-only
+    caller on a write route -> 403 platform_read_only; unreadable access tables
+    -> 503 platform_unavailable. Returns the role.
+    """
+    role = _role_for(user, platform_id)
+    if role is None:
+        raise PlatformBindingError(404, "platform_not_found")
+    if not platform_access.role_satisfies(role, need):
+        raise PlatformBindingError(403, "platform_read_only")
+    return role
 
 
 # Liveness for the site's admin diagnostics: no sign-in, no secret, no storage
@@ -198,10 +214,10 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="check_user_permission", auth_level=func.AuthLevel.ANONYMOUS)
 def check_user_permission(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Checking user permission...')
-    email = get_user_email_from_header(req)
-    if not email:
+    user = get_user(req)
+    if not user:
         return func.HttpResponse(json.dumps({"allowed": False, "email": None}), mimetype="application/json", status_code=401)
-    return func.HttpResponse(json.dumps({"allowed": True, "email": email}), mimetype="application/json")
+    return func.HttpResponse(json.dumps({"allowed": True, "email": user.email or None}), mimetype="application/json")
 
 
 def get_blob_service_client():
@@ -489,15 +505,16 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
     """
     logging.info('Generating per-skater PDF...')
 
-    email = get_user_email_from_header(req)
-    if not email:
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
-    if not is_user_allowed(email):
+    if not is_user_allowed(user):
         return func.HttpResponse("Forbidden: You are not on the allow list.", status_code=403)
 
     include_ranks = (req.params.get('includeRanks', 'false').lower() == 'true')
     try:
         platform_id = _platform_id_param(req)
+        _require_platform_access(user, platform_id, "write")
     except PlatformBindingError as e:
         return e.response()
 
@@ -568,7 +585,7 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
             "IncludeRanks": include_ranks,
             "OutputPages": pages,
             "Visible": True,
-            "CreatedBy": email,
+            "CreatedBy": user.email,
             "CreatedDate": f"{now.isoformat()}Z",
             "PlatformId": platform_id,
             "UploadedFileCount": 1,
@@ -601,8 +618,7 @@ def parse_index(req: func.HttpRequest) -> func.HttpResponse:
     Returns competition name/date/venue and the category result pages
     (CAT###RS.htm). Fetching is restricted to INDEX_ALLOWED_HOSTS (SSRF guard).
     """
-    email = get_user_email_from_header(req)
-    if not email:
+    if not get_user(req):
         return func.HttpResponse("Unauthorized", status_code=401)
 
     url = req.params.get("url")
@@ -637,13 +653,14 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
     """
     logging.info('Generating results summary...')
 
-    email = get_user_email_from_header(req)
-    if not email:
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
-    if not is_user_allowed(email):
+    if not is_user_allowed(user):
         return func.HttpResponse("Forbidden: You are not on the allow list.", status_code=403)
     try:
         platform_id = _platform_id_param(req)
+        _require_platform_access(user, platform_id, "write")
     except PlatformBindingError as e:
         return e.response()
 
@@ -774,7 +791,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
             "CatFile": html_filename,
             "OutputPages": 1,
             "Visible": True,
-            "CreatedBy": email,
+            "CreatedBy": user.email,
             "CreatedDate": f"{now.isoformat()}Z",
             "PlatformId": platform_id,
             "UploadedFileCount": 1,
@@ -807,11 +824,59 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Error processing request. Check server logs for details.", status_code=500)
 
 
+def _load_competition_for(user: User, comp_id: str, need: str):
+    """The competitions row ``comp_id`` when the caller has ``need`` on its
+    platform competition. An unknown record answers exactly like one the caller
+    may not see (404 platform_not_found); see _require_platform_access."""
+    entity = get_competition_entity(comp_id)
+    if not entity:
+        raise PlatformBindingError(404, "platform_not_found")
+    _require_platform_access(user, entity.get("PlatformId"), need)
+    return entity
+
+
+def _readable_filter(user: User):
+    """A predicate PlatformId -> bool: may the caller read records bound to it?
+
+    Admins read everything (legacy rows without a PlatformId included). For
+    everyone else the platform access tables are read lazily — one client pair
+    per request, one lookup per distinct competition. Raises
+    PlatformBindingError(503) when they cannot be read.
+    """
+    if user.is_admin:
+        return lambda platform_id: True
+    clients: dict = {}
+    decided: dict = {}
+
+    def readable(platform_id) -> bool:
+        guid = normalize_platform_id(platform_id)
+        if guid is None:
+            return False
+        if guid not in decided:
+            if not clients:
+                try:
+                    clients["identities"] = platform_access.get_identities_table_client()
+                    clients["access"] = platform_access.get_access_table_client()
+                except platform_access.PlatformAccessUnavailable:
+                    logging.error("Platform access tables unavailable; list refused")
+                    raise PlatformBindingError(503, "platform_unavailable")
+                except Exception as exc:
+                    logging.error(f"Platform access client failed: {type(exc).__name__}")
+                    raise PlatformBindingError(503, "platform_unavailable")
+            role = _role_for(user, guid, identities_client=clients["identities"], access_client=clients["access"])
+            decided[guid] = platform_access.role_satisfies(role, "read")
+        return decided[guid]
+
+    return readable
+
+
 @app.route(route="list_competitions", auth_level=func.AuthLevel.ANONYMOUS)
 def list_competitions(req: func.HttpRequest) -> func.HttpResponse:
-    """List persisted competitions (history). Not yet used by the UI."""
-    email = get_user_email_from_header(req)
-    if not email:
+    """List persisted competitions (history) the caller may read: records whose
+    platform competition grants them at least read (admins: every record,
+    including legacy ones without a PlatformId). Not yet used by the UI."""
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
 
     try:
@@ -823,9 +888,12 @@ def list_competitions(req: func.HttpRequest) -> func.HttpResponse:
         except Exception:
             pass
 
+        readable = _readable_filter(user)
         competitions = []
         for entity in list(table_client.query_entities("PartitionKey eq 'GLOBAL'")):
             if entity.get("Visible") is False:
+                continue
+            if not readable(entity.get("PlatformId")):
                 continue
             _ensure_deletion_date(table_client, entity)
             competitions.append({
@@ -838,6 +906,8 @@ def list_competitions(req: func.HttpRequest) -> func.HttpResponse:
             })
 
         return func.HttpResponse(json.dumps(competitions), mimetype="application/json")
+    except PlatformBindingError as e:
+        return e.response()
     except Exception as e:
         logging.error(f"Error listing competitions: {e}")
         return func.HttpResponse(json.dumps({"error": "Internal server error"}), status_code=500, mimetype="application/json")
@@ -845,18 +915,20 @@ def list_competitions(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="get_competition_details", auth_level=func.AuthLevel.ANONYMOUS)
 def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
-    """Return a competition's stored fields + its generated-file links. Not yet used by the UI."""
-    email = get_user_email_from_header(req)
-    if not email:
+    """Return a competition's stored fields + its generated-file links (read
+    access on its platform competition). Not yet used by the UI."""
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
 
     comp_id = req.params.get('id')
     if not comp_id:
         return func.HttpResponse("Missing id parameter", status_code=400)
 
-    entity = get_competition_entity(comp_id)
-    if not entity:
-        return func.HttpResponse("Competition not found", status_code=404)
+    try:
+        entity = _load_competition_for(user, comp_id, "read")
+    except PlatformBindingError as e:
+        return e.response()
     # Same effective legacy date as list_competitions and the sweep report.
     comp_table = get_table_client("competitions")
     if comp_table:
@@ -962,9 +1034,10 @@ def _scrub_hidden_rows(comp_table) -> int:
 
 @app.route(route="delete_competition", auth_level=func.AuthLevel.ANONYMOUS)
 def delete_competition(req: func.HttpRequest) -> func.HttpResponse:
-    """Delete a competition (blobs + rows). Not yet used by the UI."""
-    email = get_user_email_from_header(req)
-    if not email:
+    """Delete a competition (blobs + rows); write access on its platform
+    competition. Not yet used by the UI."""
+    user = get_user(req)
+    if not user:
         return func.HttpResponse("Unauthorized", status_code=401)
 
     comp_id = req.params.get('id')
@@ -972,9 +1045,10 @@ def delete_competition(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Missing id parameter", status_code=400)
 
     try:
-        entity = get_competition_entity(comp_id)
-        if not entity:
-            return func.HttpResponse("Competition not found", status_code=404)
+        entity = _load_competition_for(user, comp_id, "write")
+    except PlatformBindingError as e:
+        return e.response()
+    try:
         count = _delete_competition_data(entity, USER_DELETE_ACTOR)
         return func.HttpResponse(json.dumps({"deleted": count}), mimetype="application/json")
     except Exception as e:

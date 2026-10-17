@@ -254,8 +254,9 @@ def _visible(storage, comp_id):
 
 
 def _details(comp_id):
+    # admin: some of these rows are legacy (no PlatformId), which only admins see.
     return json.loads(call(fa.get_competition_details, make_request(
-        "get_competition_details", method="GET", params={"id": comp_id})).get_body())
+        "get_competition_details", method="GET", params={"id": comp_id}, admin=True)).get_body())
 
 
 def test_details_report_platform_binding(storage):
@@ -273,7 +274,7 @@ def test_details_and_list_agree_on_legacy_dates(storage):
     assert storage.competitions[("GLOBAL", "aaaaaaaa")]["DeletionDate"] == fa.LEGACY_DELETION_DATE
     assert _details("bbbbbbbb")["deletionDate"] == "-"  # bound rows are never backfilled locally
     assert "DeletionDate" not in storage.competitions[("GLOBAL", "bbbbbbbb")]
-    listed = json.loads(call(fa.list_competitions, make_request("list_competitions", method="GET")).get_body())
+    listed = json.loads(call(fa.list_competitions, make_request("list_competitions", method="GET", admin=True)).get_body())
     assert {r["id"]: r["deletionDate"] for r in listed} == {"aaaaaaaa": fa.LEGACY_DELETION_DATE, "bbbbbbbb": "-"}
 
 

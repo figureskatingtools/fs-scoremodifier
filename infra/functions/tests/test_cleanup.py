@@ -8,6 +8,12 @@ from conftest import call, make_request
 
 import function_app as fa
 
+
+def admin_request(*args, **kw):
+    """These rows have no PlatformId (legacy records), which only an admin may
+    see or delete; access for bound records is covered in test_access.py."""
+    return make_request(*args, admin=True, **kw)
+
 _ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
 
 
@@ -35,7 +41,7 @@ def test_list_and_details(storage):
     _seed(storage, "bbbbbbbb", days_from_now=10, visible=False)
     _seed(storage, "cccccccc", days_from_now=0, deletion=False)  # pre-feature row
 
-    resp = call(fa.list_competitions, make_request("list_competitions", method="GET"))
+    resp = call(fa.list_competitions, admin_request("list_competitions", method="GET"))
     assert resp.status_code == 200
     rows = json.loads(resp.get_body())
     assert {r["id"] for r in rows} == {"aaaaaaaa", "cccccccc"}  # soft-deleted rows hidden
@@ -43,22 +49,22 @@ def test_list_and_details(storage):
     assert legacy["deletionDate"] == fa.LEGACY_DELETION_DATE
     assert storage.competitions[("GLOBAL", "cccccccc")]["DeletionDate"] == fa.LEGACY_DELETION_DATE  # backfilled
 
-    resp = call(fa.get_competition_details, make_request("get_competition_details", method="GET", params={"id": "aaaaaaaa"}))
+    resp = call(fa.get_competition_details, admin_request("get_competition_details", method="GET", params={"id": "aaaaaaaa"}))
     body = json.loads(resp.get_body())
     assert resp.status_code == 200
     assert body["name"] == "Comp aaaaaaaa"
     assert [f["fileName"] for f in body["generatedFiles"]] == ["per-skater.pdf"]
-    assert call(fa.get_competition_details, make_request("get_competition_details", method="GET", params={"id": "nope"})).status_code == 404
-    assert call(fa.get_competition_details, make_request("get_competition_details", method="GET")).status_code == 400
+    assert call(fa.get_competition_details, admin_request("get_competition_details", method="GET", params={"id": "nope"})).status_code == 404
+    assert call(fa.get_competition_details, admin_request("get_competition_details", method="GET")).status_code == 400
 
 
 def test_delete_competition_removes_blobs_and_soft_deletes_row(storage):
     folder = _seed(storage, "dddddddd", days_from_now=10)
     other = _seed(storage, "eeeeeeee", days_from_now=10)
 
-    assert call(fa.delete_competition, make_request("delete_competition", params={"id": "nope"})).status_code == 404
-    assert call(fa.delete_competition, make_request("delete_competition")).status_code == 400
-    resp = call(fa.delete_competition, make_request("delete_competition", params={"id": "dddddddd"}))
+    assert call(fa.delete_competition, admin_request("delete_competition", params={"id": "nope"})).status_code == 404
+    assert call(fa.delete_competition, admin_request("delete_competition")).status_code == 400
+    resp = call(fa.delete_competition, admin_request("delete_competition", params={"id": "dddddddd"}))
     assert resp.status_code == 200, resp.get_body()
 
     assert not any(b.startswith(f"{folder}/") for b in storage.blobs)
@@ -124,7 +130,7 @@ def test_sweep_scrubs_addresses_from_old_deleted_rows(storage):
 
 def test_details_report_retention(storage):
     _seed(storage, "aaaaaaaa", days_from_now=10)
-    body = json.loads(call(fa.get_competition_details, make_request(
+    body = json.loads(call(fa.get_competition_details, admin_request(
         "get_competition_details", method="GET", params={"id": "aaaaaaaa"})).get_body())
     assert body["platformId"] is None
     assert body["deletionDate"] == storage.competitions[("GLOBAL", "aaaaaaaa")]["DeletionDate"]

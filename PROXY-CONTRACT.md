@@ -14,86 +14,112 @@ request headers set by the router**. Nothing else may call these endpoints.
 
 | Header | Set by | Purpose |
 |---|---|---|
-| `X-Proxy-Secret` | router `server.js` | Proves the request came through the router. Compared against the `PROXY_SHARED_SECRET` app setting by `_proxy_secret_ok()`. |
-| `X-Forwarded-User-Email` | router `server.js` | The signed-in user's email, taken from the router's Easy Auth principal. |
+| `X-Proxy-Secret` | router `server.js` | Proves the request came through the router. Compared against the `PROXY_SHARED_SECRET` app setting by `_proxy_secret_ok()` (`hmac.compare_digest`). |
+| `X-Forwarded-User-Tid` | router `server.js` | Entra tenant id (lowercase GUID) of the signed-in principal. |
+| `X-Forwarded-User-Oid` | router `server.js` | Entra object id (lowercase GUID) of the signed-in principal. With the tid, **the** identity. |
+| `X-Forwarded-User-Email` | router `server.js` | E-mail, lowercased. Display and the `CreatedBy` history only — **never** authorisation. Optional. |
+| `X-Forwarded-User-Name` | router `server.js` | Display name, `encodeURIComponent`-encoded (decoded with `urllib.parse.unquote`). Optional. |
+| `X-Forwarded-User-Admin` | router `server.js` | `1` only when the router's `isAdminRequest` is true; absent otherwise. |
 
-Both are defined in `infra/functions/function_app.py`.
+All are read in `infra/functions/function_app.py` (`get_user()` → `User(tid,
+oid, email, name, is_admin)`). The router builds its outbound headers from an
+allow-list, so a browser cannot set any of them; the secret is what stops a
+direct caller from setting them on the public Function App.
 
-### `X-Proxy-Secret`
+### `X-Proxy-Secret` — fails closed
 
 - The router holds the same secret in its `PROXY_SHARED_SECRET_SCOREMODIFIER`
   app setting; this Function App holds it as `PROXY_SHARED_SECRET`
   (`infra/modules/function.bicep`, injected by CI from the GitHub environment
   secret `PROXY_SHARED_SECRET`).
-- **Enforced only when the app setting is non-empty.** An unset secret fails
-  open, so local `func start` and a brief pre-rollout window keep working
-  instead of locking everyone out.
-- A mismatch makes `get_user_email_from_header()` return `None`, which every
-  route turns into **401** — except `GET health`, which needs neither identity
-  nor the secret: it answers `{"status": "ok", "service": "fs-scoremodifier"}`
-  without touching storage, for the site's admin diagnostics.
+- **An unset or empty `PROXY_SHARED_SECRET` rejects every request** (401), and
+  so does a missing or wrong header. Local `func start` must set a secret too.
+- The gate runs before any identity header is read. `GET health` needs neither
+  identity nor the secret: it answers `{"status": "ok", "service":
+  "fs-scoremodifier"}` without touching storage, for the site's admin
+  diagnostics.
 
-### `X-Forwarded-User-Email`
+### Identity — `x-forwarded-user-*` only
 
-The browser never sets this — it would be trivially spoofable without the
-shared-secret gate above. The router overwrites any inbound value.
+- `X-Forwarded-User-Tid` and `-Oid` must both be GUIDs (trimmed, lowercased);
+  missing or malformed → no identity → **401** on every route.
+- Nothing else is an identity source any more: `X-MS-CLIENT-PRINCIPAL-NAME`,
+  the base64 `X-MS-CLIENT-PRINCIPAL` JSON and `Authorization: Bearer` JWTs are
+  ignored, and an e-mail header alone is not enough.
+- `is_admin` is exactly `X-Forwarded-User-Admin == "1"` (trusted only because
+  the secret gate fails closed).
+- Without an identity the function logs the request's header **names** (never
+  values) and responds 401.
 
-## Header precedence in `get_user_email_from_header()`
+Header names are matched case-insensitively.
 
-Checked in order; the first hit wins:
+## Competition access
 
-0. **`_proxy_secret_ok(req)`** — if the shared secret is configured and missing
-   or wrong, return `None` immediately (→ 401). This gate runs *before* any
-   identity is read.
-1. `X-MS-CLIENT-PRINCIPAL-NAME` — injected directly by App Service Easy Auth on
-   this Function App. Not used in the current topology (no identity provider is
-   configured here) but kept for direct-Easy-Auth setups.
-2. `X-Forwarded-User-Email` — **the production path**, set by the router proxy.
-3. `x-ms-client-principal` — base64 JSON principal (SWA style); `userDetails` is
-   used as the email.
-4. `Authorization: Bearer <jwt>` — payload decoded (base64 only, **not**
-   signature-verified) and read in order:
-   `preferred_username` → `email` → `upn` → `unique_name` → `emails[0]` →
-   `name` → `oid`.
+The platform registry in `figureskatingtools-site` decides who may see or
+change a competition. `infra/functions/platform_access.py` (**byte-identical**
+with fs-judgepapers and fs-protocolgenerator; its docstring is the contract)
+maps `(tid, oid)` to the platform user through the platform's
+`useridentities` table and reads that user's role from `competitionaccess`
+(`owner` > `write` > `read`), both on the account named by
+`PLATFORM_STORAGE_ACCOUNT` (Table Data Reader grants from the site repo's
+`shared-data-access.bicep`; table names overridable with
+`PLATFORM_IDENTITIES_TABLE` / `PLATFORM_ACCESS_TABLE`). Answers are cached for
+30 s, so a revoked share stops working within that time. Admins are `owner`
+everywhere without a lookup.
 
-If none match, the function logs the non-auth headers and returns `None` → the
-route responds **401**.
+| Route | Needs |
+|---|---|
+| `POST generate?platformId=` | write on `platformId` |
+| `POST generate_results?platformId=` | write on `platformId` |
+| `GET get_competition_details?id=` | read on the record's `PlatformId` |
+| `delete_competition?id=` | write on the record's `PlatformId` |
+| `GET list_competitions` | lists only records whose `PlatformId` the caller can read (admin: all) |
+| `GET parse_index?url=`, `check_user_permission` | sign-in only (no competition) |
+| `GET health` | nothing |
 
-Header names are matched case-insensitively (each lookup tries both the
-canonical and lowercase spelling).
+Records without a (valid) `PlatformId` are legacy rows: **admin only**.
+
+| Situation | Response (JSON) |
+|---|---|
+| No role: no grant, unknown platform competition or identity, unknown record id, legacy record for a non-admin | 404 `{"error": "platform_not_found"}` — existence is never revealed |
+| Read-only caller on a write route | 403 `{"error": "platform_read_only"}` |
+| Access tables unreadable (`PLATFORM_STORAGE_ACCOUNT` unset, table missing, RBAC, network) | 503 `{"error": "platform_unavailable"}` |
+
+The access check runs right after `platformId` validation (400
+`platform_id_required`) and before the upload is read; the retention-clock
+binding (404/410/503, see `CLAUDE.md` → Retention) follows it.
 
 ## Local / manual testing
 
-Against a local `func start` (port 7071) with `PROXY_SHARED_SECRET` unset, the
-secret header is optional:
+The secret is enforced everywhere, so set one for a local `func start` too
+(`PROXY_SHARED_SECRET` in `local.settings.json`). Without
+`PLATFORM_STORAGE_ACCOUNT` the access tables are unreadable, so competition
+routes answer 503 — except for an admin (`x-forwarded-user-admin: 1`), who
+needs no lookup.
 
 ```bash
-curl -i "http://localhost:7071/api/check_user_permission" \
-  -H "x-forwarded-user-email: someone@example.com"
-```
-
-Against a deployed Function App (secret enforced):
-
-```bash
-FUNC=func-fs-scoremodifier-xxxxxxxx           # deploy-infra output functionAppName
+FUNC=func-fs-scoremodifier-xxxxxxxx           # deploy-infra output functionAppName (or localhost:7071)
 SECRET=…                                      # GitHub environment secret PROXY_SHARED_SECRET
+WHO=(-H "x-proxy-secret: $SECRET"
+     -H "x-forwarded-user-tid: $TENANT_ID"    # your Entra tenant id
+     -H "x-forwarded-user-oid: $OBJECT_ID"    # your Entra object id
+     -H "x-forwarded-user-email: someone@example.com")
 
 # Auth probe — expect 200
-curl -i "https://$FUNC.azurewebsites.net/api/check_user_permission" \
-  -H "x-proxy-secret: $SECRET" \
-  -H "x-forwarded-user-email: someone@example.com"
+curl -i "https://$FUNC.azurewebsites.net/api/check_user_permission" "${WHO[@]}"
 
-# Wrong/absent secret — expect 401
+# Wrong/absent secret, or no tid/oid — expect 401
 curl -i "https://$FUNC.azurewebsites.net/api/check_user_permission" \
   -H "x-forwarded-user-email: someone@example.com"
 
-# A real workload endpoint (PDF in the body). platformId = an existing platform
-# competition GUID (required; 400 platform_id_required without it, 404
-# platform_not_found for an unknown competition, 410 platform_deleted, 503
-# platform_unavailable when the platform clock cannot be read — nothing stored).
+# A real workload endpoint (PDF in the body). platformId = a platform
+# competition GUID you have write access to (required; 400
+# platform_id_required without it, 404 platform_not_found without access or
+# for an unknown competition, 403 platform_read_only with read access, 410
+# platform_deleted, 503 platform_unavailable when the platform tables cannot
+# be read — nothing stored).
 curl -i "https://$FUNC.azurewebsites.net/api/generate?includeRanks=false&platformId=$PLATFORM_ID" \
-  -H "x-proxy-secret: $SECRET" \
-  -H "x-forwarded-user-email: someone@example.com" \
+  "${WHO[@]}" \
   -H "content-type: application/pdf" \
   --data-binary @judges-details-per-skater.pdf
 ```
@@ -106,4 +132,5 @@ the site repo's matching environment. The backend compares against exactly one
 value, so any rotation has a short window where the two sides disagree and calls
 401. Update both GitHub secrets, then redeploy the backend and the site
 back-to-back during a quiet period. Do **not** rotate by clearing the setting —
-an empty `PROXY_SHARED_SECRET` disables the gate entirely.
+an empty `PROXY_SHARED_SECRET` now rejects every request (the gate fails
+closed), which is an outage, not a bypass.

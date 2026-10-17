@@ -147,16 +147,30 @@ Four pieces:
 ### Auth chain (important when touching any endpoint) — see `PROXY-CONTRACT.md`
 
 All function routes are `AuthLevel.ANONYMOUS`; real auth is Entra ID Easy Auth on the **router Web App
-in the site repo**. Easy Auth injects `X-MS-CLIENT-PRINCIPAL*` there → the router forwards the email as
-`X-Forwarded-User-Email` to this Function App → `get_user_email_from_header()` resolves it (direct
-header → forwarded header → base64 principal → Bearer JWT). Every endpoint calls it and returns 401 on
-`None`. **The Function App itself must be `AllowAnonymous`** (`function.bicep` `globalValidation`), not
-`requireAuthentication`, or Easy Auth would 401 the proxied requests (which carry only the email header,
-no bearer token); no identity provider is configured on it at all any more. Because the function is
-public, a **shared secret** stops spoofing: the router holds `PROXY_SHARED_SECRET_SCOREMODIFIER` and
-sends it as `X-Proxy-Secret`, and `_proxy_secret_ok()` rejects mismatches against this app's
-`PROXY_SHARED_SECRET`. Enforced only when the env var is set (local/dev fail open). `is_user_allowed()`
+in the site repo**. The router decodes the Easy Auth principal and forwards it as
+`x-forwarded-user-tid` / `-oid` (the identity, lowercase GUIDs), `-email` (display/`CreatedBy` only),
+`-name` (URI-encoded) and `-admin: 1` for admins → `get_user()` builds a `User` from those headers
+**only** (no `X-MS-CLIENT-PRINCIPAL*`, no Bearer JWT; missing/non-GUID tid or oid → `None`). Every
+endpoint but `health` calls it and returns 401 on `None`. **The Function App itself must be
+`AllowAnonymous`** (`function.bicep` `globalValidation`), not `requireAuthentication`, or Easy Auth
+would 401 the proxied requests; no identity provider is configured on it at all any more. Because the
+function is public, a **shared secret** stops spoofing: the router holds
+`PROXY_SHARED_SECRET_SCOREMODIFIER` and sends it as `X-Proxy-Secret`, and `_proxy_secret_ok()` compares
+it with `hmac.compare_digest` against this app's `PROXY_SHARED_SECRET` — **fail closed**: an unset/empty
+secret rejects everything (local `func start` needs one too). `is_user_allowed()`
 allows all authenticated users (hook for a future allowlist).
+
+**Competition access** (`platform_access.py`, **byte-identical** with fs-judgepapers and
+fs-protocolgenerator — its docstring is the contract): `role_for(platformId, tid, oid, is_admin)` reads
+the platform's `useridentities` + `competitionaccess` tables (30 s in-process cache; admin = owner, no
+lookup). `generate` / `generate_results` need **write** on `platformId` (checked right after the
+400 `platform_id_required` check, before the upload is read); `get_competition_details` needs **read**
+and `delete_competition` **write** on the record's `PlatformId`; `list_competitions` returns only records
+the caller can read (admin: all); records without a `PlatformId` are admin-only; `parse_index` is
+sign-in only. No role / unknown record → 404 `platform_not_found`, read on a write route → 403
+`platform_read_only`, tables unreadable (incl. `PLATFORM_STORAGE_ACCOUNT` unset) → 503
+`platform_unavailable` — JSON `{"error": …}`. Tests: `tests/test_auth.py`, `tests/test_access.py` (the
+autouse `access` fixture in `conftest.py` fakes both tables; by default the test user owns everything).
 
 ### Storage layout & data model
 

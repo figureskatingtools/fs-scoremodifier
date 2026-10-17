@@ -10,6 +10,14 @@ get/create/upsert/update/delete/query). ``AzureWebJobsStorage`` is set to a
 dummy connection string so ``create_and_store_sas_link`` takes the account-key
 branch and runs the real ``generate_blob_sas`` with no network.
 
+Every request carries the router's headers by default (``make_request``): the
+proxy secret (the gate fails closed, so the suite sets ``PROXY_SHARED_SECRET``)
+and the test user's ``x-forwarded-user-tid/-oid/-email``. Platform access
+(``platform_access.py``) reads in-memory ``useridentities`` /
+``competitionaccess`` tables from the autouse ``access`` fixture; by default
+the test user is owner of every competition (``access.grant_all``) — tests of
+the role matrix set it to None and grant explicitly.
+
 Real FSM "Judges Details Per Skater" exports are not committed (they carry
 skaters' names). Tests that need one read ``SCOREMODIFIER_SAMPLE_DIR``
 (default ``<repo>/../fs-samples/scoremodifier``) and skip when it is missing.
@@ -49,9 +57,14 @@ import azure.functions as func  # noqa: E402
 from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError  # noqa: E402
 
 import function_app as fa  # noqa: E402
+import platform_access  # noqa: E402
 import platform_clock  # noqa: E402
 
 TEST_EMAIL = "tester@example.com"
+TEST_SECRET = "test-proxy-secret"
+TEST_TID = "11111111-2222-4333-8444-555555555555"
+TEST_OID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+TEST_USER_ID = "99999999-8888-4777-8666-555555555555"
 # The site's active competition (platformId is required on every generation).
 TEST_PLATFORM_ID = "0f8fad5b-d9cb-469f-a165-70867728950e"
 
@@ -169,7 +182,7 @@ def storage(monkeypatch) -> FakeStorage:
     st = FakeStorage()
     monkeypatch.setattr(fa, "get_blob_service_client", lambda: st.blob_service)
     monkeypatch.setattr(fa, "get_table_client", lambda table_name="generatedpapers": st.table(table_name))
-    monkeypatch.delenv("PROXY_SHARED_SECRET", raising=False)
+    monkeypatch.setenv("PROXY_SHARED_SECRET", TEST_SECRET)
     # Platform clock off unless a test opts in with the `platform` fixture.
     monkeypatch.delenv("PLATFORM_STORAGE_ACCOUNT", raising=False)
     return st
@@ -231,13 +244,92 @@ def platform(monkeypatch) -> FakePlatform:
     return pf
 
 
+class _AccessTableClient:
+    """One client on a platform access table; behaviour follows FakeAccess at read time."""
+
+    def __init__(self, fa_, table):
+        self.fa = fa_
+        self.table = table
+
+    def get_entity(self, partition_key, row_key):
+        acc = self.fa
+        acc.reads += 1
+        if acc.unreachable:
+            raise HttpResponseError("platform access unreachable")
+        if acc.table_missing:
+            exc = ResourceNotFoundError("The table specified does not exist. ErrorCode:TableNotFound")
+            exc.error_code = "TableNotFound"
+            raise exc
+        if self.table == "identities":
+            user_id = acc.identities.get(row_key) if partition_key == "IDENTITY" else None
+            if user_id:
+                return {"PartitionKey": partition_key, "RowKey": row_key, "UserId": user_id}
+        else:
+            role = acc.grants.get((partition_key, row_key))
+            if role is None and acc.grant_all and row_key in acc.identities.values():
+                role = acc.grant_all
+            if role:
+                return {"PartitionKey": partition_key, "RowKey": row_key, "Role": role}
+        exc = ResourceNotFoundError("The specified resource does not exist. ErrorCode:ResourceNotFound")
+        exc.error_code = "ResourceNotFound"
+        raise exc
+
+
+class FakeAccess:
+    """The platform's `useridentities` + `competitionaccess` tables."""
+
+    def __init__(self):
+        self.identities = {f"{TEST_TID}_{TEST_OID}": TEST_USER_ID}  # "<tid>_<oid>" -> userId
+        self.grants: dict = {}  # (competition guid, userId) -> role
+        self.grant_all = "owner"  # role every known user has on every competition; None = explicit grants only
+        self.unreachable = False
+        self.table_missing = False
+        self.reads = 0
+        self.clients = 0
+
+    def add_user(self, tid, oid, user_id):
+        self.identities[f"{tid}_{oid}"] = user_id
+
+    def grant(self, guid, role, user_id=TEST_USER_ID):
+        self.grants[(guid.lower(), user_id)] = role
+
+    def identities_client(self):
+        self.clients += 1
+        return _AccessTableClient(self, "identities")
+
+    def access_client(self):
+        self.clients += 1
+        return _AccessTableClient(self, "access")
+
+
+@pytest.fixture(autouse=True)
+def access(monkeypatch) -> FakeAccess:
+    acc = FakeAccess()
+    platform_access.clear_cache()
+    monkeypatch.setattr(platform_access, "get_identities_table_client", acc.identities_client)
+    monkeypatch.setattr(platform_access, "get_access_table_client", acc.access_client)
+    yield acc
+    platform_access.clear_cache()
+
+
 # ── requests ──────────────────────────────────────────────────────────────────
 
-def make_request(route, *, body=b"", params=None, headers=None, method="POST", email=TEST_EMAIL):
-    """A real azure.functions.HttpRequest the way the router proxy sends it."""
+def make_request(route, *, body=b"", params=None, headers=None, method="POST", email=TEST_EMAIL,
+                 tid=TEST_TID, oid=TEST_OID, admin=False, secret=TEST_SECRET, anonymous=False):
+    """A real azure.functions.HttpRequest the way the router proxy sends it.
+    ``anonymous=True`` drops every identity header (the secret stays)."""
     h = {}
-    if email:
-        h["x-forwarded-user-email"] = email
+    if secret is not None:
+        h["x-proxy-secret"] = secret
+    if not anonymous:
+        if tid:
+            h["x-forwarded-user-tid"] = tid
+        if oid:
+            h["x-forwarded-user-oid"] = oid
+        if email:
+            h["x-forwarded-user-email"] = email
+        if admin:
+            h["x-forwarded-user-admin"] = "1"
     h.update(headers or {})
     return func.HttpRequest(
         method=method,
