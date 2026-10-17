@@ -95,6 +95,28 @@ The access check runs right after `platformId` validation (400
 `platform_id_required`) and before the upload is read; the retention-clock
 binding (404/410/503, see `CLAUDE.md` → Retention) follows it.
 
+## Rollout: revoke the old 5-day links
+
+Before this change every download link was a 5-day user-delegation SAS (the
+deployed app has only `AzureWebJobsStorage__accountName`, so the account-key
+branch never ran in Azure). Dropping the stored URLs does not invalidate links
+already handed out, so **right after this change is deployed to an
+environment**, revoke the account's user delegation keys (needs Storage Account
+Contributor or Owner on the account):
+
+```bash
+# test
+az storage account revoke-delegation-keys -g rg-fs-scoremodifier-test -n stfsscore5gv2x52ewz6ls
+# prod
+az storage account revoke-delegation-keys -g rg-fs-scoremodifier-prod -n stfsscoreujhnzulzviaxc
+```
+
+The account is `stfsscore` + the same `uniqueString` suffix as the Function App
+(`func-fs-scoremodifier-<suffix>`). Every user-delegation SAS on the account
+stops working at once, including the 15-minute links minted in the last
+minutes; the frontend fetches a fresh one on the next click. Run it after the
+deploy, never before: the old code would keep minting 5-day links.
+
 ## Local / manual testing
 
 The secret is enforced everywhere, so set one for a local `func start` too
