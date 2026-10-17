@@ -143,7 +143,10 @@ def resolve_user_id(tid, oid, identities_client=None):
         raise PlatformAccessUnavailable(type(exc).__name__) from exc
     entity = _get(client, IDENTITY_PARTITION, key)
     user_id = _guid(entity.get("UserId")) if entity else None
-    _store(("id", key), user_id)
+    if user_id is not None:
+        # Unknown identities are not cached: the platform creates the user on
+        # their first request, and a cached miss would hide that for a while.
+        _store(("id", key), user_id)
     return user_id
 
 
