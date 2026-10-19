@@ -112,11 +112,11 @@ Four pieces:
    `?includeRanks=true|false`, default `false` ⇒ `hide_non_podium_ranks=True`): runs
    `split_per_skater`, derives a name from the PDF (`<segment> — <printed date>`, page-0 text), stores
    `source.pdf` + `output/per-skater.pdf` in blob storage, writes a `competitions` row + a
-   `generatedpapers` row with a 5-day read SAS link, and returns the download URL. **`generate_results`**
+   `generatedpapers` row (the blob name — no link is stored), and returns a fresh 15-minute read SAS URL. **`generate_results`**
    (POST, body = the PDF, metadata via query params `competition/date/venue/category/supertitle/catFile/indexUrl`):
    runs `extract_results` → `render_results_pdf` + `render_results_html`, stores `output/results.pdf`
    + `output/<CAT###RS>.htm`, writes a `competitions` row (`Tool="results"`) + a `generatedpapers` row
-   per file, returns both URLs. Both generators **require** a **`platformId`** query param (the
+   per file, returns fresh 15-minute URLs for both. Both generators **require** a **`platformId`** query param (the
    site's active competition GUID; normalized; missing/malformed → 400 `platform_id_required`),
    stored as `PlatformId` on the row — see *Retention* below. **`parse_index`** (GET `?url=`) fetches + parses the competition
    index.htm (SSRF-guarded to `INDEX_ALLOWED_HOSTS`, default `figureskatingresults.fi`) → name/date/venue
@@ -147,16 +147,32 @@ Four pieces:
 ### Auth chain (important when touching any endpoint) — see `PROXY-CONTRACT.md`
 
 All function routes are `AuthLevel.ANONYMOUS`; real auth is Entra ID Easy Auth on the **router Web App
-in the site repo**. Easy Auth injects `X-MS-CLIENT-PRINCIPAL*` there → the router forwards the email as
-`X-Forwarded-User-Email` to this Function App → `get_user_email_from_header()` resolves it (direct
-header → forwarded header → base64 principal → Bearer JWT). Every endpoint calls it and returns 401 on
-`None`. **The Function App itself must be `AllowAnonymous`** (`function.bicep` `globalValidation`), not
-`requireAuthentication`, or Easy Auth would 401 the proxied requests (which carry only the email header,
-no bearer token); no identity provider is configured on it at all any more. Because the function is
-public, a **shared secret** stops spoofing: the router holds `PROXY_SHARED_SECRET_SCOREMODIFIER` and
-sends it as `X-Proxy-Secret`, and `_proxy_secret_ok()` rejects mismatches against this app's
-`PROXY_SHARED_SECRET`. Enforced only when the env var is set (local/dev fail open). `is_user_allowed()`
+in the site repo**. The router decodes the Easy Auth principal and forwards it as
+`x-forwarded-user-tid` / `-oid` (the identity, lowercase GUIDs), `-email` (display/`CreatedBy` only),
+`-name` (URI-encoded) and `-admin: 1` for admins → `get_user()` builds a `User` from those headers
+**only** (no `X-MS-CLIENT-PRINCIPAL*`, no Bearer JWT; missing/non-GUID tid or oid → `None`). Every
+endpoint but `health` calls it and returns 401 on `None`. **The Function App itself must be
+`AllowAnonymous`** (`function.bicep` `globalValidation`), not `requireAuthentication`, or Easy Auth
+would 401 the proxied requests; no identity provider is configured on it at all any more. Because the
+function is public, a **shared secret** stops spoofing: the router holds
+`PROXY_SHARED_SECRET_SCOREMODIFIER` and sends it as `X-Proxy-Secret`, and `_proxy_secret_ok()` compares
+it with `hmac.compare_digest` against this app's `PROXY_SHARED_SECRET` — **fail closed**: an unset/empty
+secret rejects everything (local `func start` needs one too). `is_user_allowed()`
 allows all authenticated users (hook for a future allowlist).
+
+**Competition access** (`platform_access.py`, **byte-identical** with fs-judgepapers and
+fs-protocolgenerator — its docstring is the contract): `role_for(platformId, tid, oid, is_admin)` reads
+the platform's `useridentities` + `competitionaccess` tables (30 s in-process cache; admin = owner, no
+lookup). `generate` / `generate_results` need **write** on `platformId` (checked right after the
+400 `platform_id_required` check, before the upload is read); `get_competition_details` needs **read**
+(it lists the generated files with a fresh 15-minute read SAS each, minted after the check — `_ReadLinks`,
+one user-delegation key per response) and `delete_competition` (**POST only**, id from `?id=` or JSON
+`{"id"}`) **owner** on the record's `PlatformId`; `list_competitions` returns only records
+the caller can read (admin: all); records without a `PlatformId` are admin-only; `parse_index` is
+sign-in only. No role / unknown record → 404 `platform_not_found`, read on a write route → 403
+`platform_read_only`, read/write on an owner route → 403 `platform_owner_required`, tables unreadable (incl. `PLATFORM_STORAGE_ACCOUNT` unset) → 503
+`platform_unavailable` — JSON `{"error": …}`. Tests: `tests/test_auth.py`, `tests/test_access.py` (the
+autouse `access` fixture in `conftest.py` fakes both tables; by default the test user owns everything).
 
 ### Storage layout & data model
 
@@ -165,7 +181,9 @@ Storage account is dedicated to this tool. Container `fs-scoremodifier`:
 - `{sanitized-name}-{id}/output/per-skater.pdf` — the generated result
 Tables: `competitions` (PartitionKey `GLOBAL`, RowKey = 8-char hex id; `Name`, `FolderPath`, `Segment`,
 `PrintedDate`, `IncludeRanks`, `OutputPages`, `Visible`, `CreatedBy/CreatedDate`, `DeletionDate`,
-counters, optional `PlatformId`) and `generatedpapers` (PartitionKey = competition id; SAS download links). Names are auto-
+counters, optional `PlatformId`) and `generatedpapers` (PartitionKey = competition id; `BlobName`, `FileName`,
+`FileSize`, `Description` — no links: they are minted per response, valid 15 minutes; older rows' stored
+5-day `Url` is never returned, only its blob name is used). Names are auto-
 derived from the PDF and are **not** unique — the id is the identifier. Every storage helper supports
 two credential modes: managed identity when `AzureWebJobsStorage__accountName` is set (prod; SAS via
 user-delegation key), connection string via `AzureWebJobsStorage` otherwise (local; SAS via account key).
