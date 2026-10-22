@@ -102,6 +102,14 @@ deploy_infra.sh, deploy_backend.sh
 .github/workflows/deploy.yml
 ```
 
-## License
+## Licence
 
-PyMuPDF is licensed AGPL-3.0.
+The source code is licensed under the GNU Affero General Public License, version 3 only (SPDX:
+`AGPL-3.0-only`); see [LICENSE](LICENSE).
+
+The figureskatingtools name, logo and document templates (including
+`scoremodifier/assets/logo.png`) are not covered by this licence and remain the property of
+their owner; all rights reserved.
+
+The bundled Raleway fonts in `scoremodifier/assets/` keep their own licence, the SIL Open Font
+License 1.1 (`Raleway-OFL.txt`). PyMuPDF, which this tool uses, is itself licensed AGPL-3.0.
