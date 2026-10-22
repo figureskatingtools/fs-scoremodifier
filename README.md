@@ -26,7 +26,12 @@ everyone outside the podium. Currently used for the **Tulokkaat (Beginners)** ca
 | **Backend** | Python Azure Functions (Flex Consumption, HTTP) — `generate` endpoint calls the core |
 | **Auth** | Microsoft Entra ID Easy Auth on the site router; this app trusts `X-Proxy-Secret` + `X-Forwarded-User-Email` |
 | **Storage** | Azure Blob Storage (uploaded + generated PDFs) + Table Storage (`competitions`, `generatedpapers`) |
-| **Infra** | Azure Bicep (subscription-scoped), own storage account — storage + Function App + RBAC only |
+| **Infra** | Azure Bicep (subscription-scoped), own storage account — storage + Function App (App Insights on a 90-day Log Analytics workspace) + RBAC only |
+
+**Retention.** A competition's files and the creator's e-mail address are deleted when its
+competition is deleted on figureskatingtools.com (anonymous usage statistics stay). A record no
+competition stands behind any more (or one from before the shared competitions) is deleted the same
+way once it is more than 60 days old. Logs are kept 90 days.
 
 The tool page is a single view: upload the PDF, tick **Include ranks** (off by default — non-podium
 ranks are hidden), click **Generate**, download the result. Each run is persisted (source + output
