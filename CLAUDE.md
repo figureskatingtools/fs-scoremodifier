@@ -54,7 +54,8 @@ python3.13 -m venv .venv && source .venv/bin/activate && pip install -r requirem
 ln -s ../../scoremodifier scoremodifier && func start   # the symlink is gitignored
 
 # Deployment (manual; CI does this automatically — see Branch / Deploy Strategy)
-./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>]
+./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>] [--platform-storage <ACCOUNT>] [--orphan-purge true|false]
+# --orphan-purge omitted = keep the deployed ORPHAN_PURGE_ENABLED (false if unreadable), never the Bicep default true
 ./deploy_backend.sh -g <resource-group>     # bundles the core package + pip installs (needs python3.13 or PYTHON=…), ZIP deploy
 ```
 

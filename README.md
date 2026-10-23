@@ -59,9 +59,13 @@ CI (`.github/workflows/deploy.yml`) deploys infra (Bicep) → backend on **push 
 
 Manual:
 ```bash
-./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>]
+./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>] [--platform-storage <ACCOUNT>] [--orphan-purge true|false]
 ./deploy_backend.sh -g <resource-group>
 ```
+
+Without `--orphan-purge`, `deploy_infra.sh` keeps the Function App's current `ORPHAN_PURGE_ENABLED`
+(the nightly orphan deletion); if it can't read it (no app yet, no permission) it deploys `false`
+(dry run) and says so, so a manual run never re-enables a purge the workflow deployed off.
 
 ### One-time setup
 1. Create GitHub Environments `test` and `prod` with:
