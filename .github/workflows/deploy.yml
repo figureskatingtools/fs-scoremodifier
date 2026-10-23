@@ -108,6 +108,7 @@ jobs:
               resourceGroupName="${{ vars.RESOURCE_GROUP_NAME }}" \
               proxySharedSecret="${{ secrets.PROXY_SHARED_SECRET }}" \
               platformStorageAccountName="${{ vars.PLATFORM_STORAGE_ACCOUNT }}" \
+              orphanPurgeEnabled="${{ vars.ORPHAN_PURGE_ENABLED != 'false' }}" \
             --query 'properties.outputs' \
             -o json)
 

@@ -29,8 +29,11 @@ from platform_clock import (
     PlatformClockUnavailable,
     get_platform_table_client,
     normalize_platform_id,
+    orphan_old_enough,
+    orphan_sweep_allowed,
     platform_says_delete,
     read_platform_clock,
+    record_age_reference,
     to_iso_z,
 )
 
@@ -92,6 +95,23 @@ USER_DELETE_ACTOR = "user"
 # CreatedBy/DeletedBy values that are not an e-mail address. Anything else on a
 # hidden (deleted) row is scrubbed by the nightly sweep.
 NON_PERSONAL_ACTORS = frozenset({"", "-", USER_DELETE_ACTOR, AUTO_CLEANUP_ACTOR})
+
+
+def _orphan_purge_enabled() -> bool:
+    """ORPHAN_PURGE_ENABLED (Bicep-owned, on by default): false = the nightly
+    orphan step only logs what it would delete. Unset reads as off."""
+    return (os.environ.get("ORPHAN_PURGE_ENABLED") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _orphan_reference(entity):
+    """When an orphaned row's 60 days count from: CreatedDate, else the newest
+    timestamp the row has (its deletion date, the Table Timestamp)."""
+    metadata = getattr(entity, "metadata", None) or {}
+    return record_age_reference(
+        entity.get("CreatedDate"),
+        entity.get("DeletedDate"),
+        metadata.get("timestamp"),
+    )
 
 
 def _utcnow() -> datetime:
@@ -1145,25 +1165,34 @@ def auto_delete_expired_competitions(timer: func.TimerRequest) -> None:
     _run_cleanup_sweep(datetime.now(timezone.utc))
 
 
-def _run_cleanup_sweep(now: datetime) -> int:
+def _run_cleanup_sweep(now: datetime, orphan_purge: bool | None = None) -> dict:
     """Delete competitions that are due, then scrub old soft-deleted rows.
 
     Bound rows (PlatformId) are deleted only on the platform's verdict
     (``platform_says_delete``: deleted or purged — never the date alone); their
-    cached DeletionDate is refreshed otherwise. A bound row whose platform clock
-    row is missing is kept with a warning. When the platform cannot be read
+    cached DeletionDate is refreshed otherwise. When the platform cannot be read
     (outage, missing table, PLATFORM_STORAGE_ACCOUNT unset) bound rows are
     skipped with an error and retried the next night. Legacy rows without a
-    PlatformId are deleted on their stored DeletionDate. Returns the number of
-    competitions deleted.
+    PlatformId are deleted on their stored DeletionDate.
+
+    Orphans: a live row with no PlatformId (or one that isn't a GUID), or whose
+    clock row a successful read did not find, is deleted the same way (data
+    gone, statistics kept, CreatedBy blanked) once it is more than 60 days old
+    (``_orphan_reference``); younger ones are kept. The step runs only when one
+    probe of the clock table read at least one row (or the tool has no bound
+    rows) — an unreadable, unconfigured or empty clock table aborts it for the
+    run — and only deletes with ORPHAN_PURGE_ENABLED on (otherwise it logs what
+    it would). Returns the per-run counts.
     """
     logging.info("Running auto-deletion sweep for expired competitions...")
-    deleted = 0
+    purge = _orphan_purge_enabled() if orphan_purge is None else orphan_purge
+    stats = {"deleted": 0, "skipped": 0, "failed": 0,
+             "orphaned": 0, "orphan_kept": 0, "orphan_dry_run": 0, "orphan_skipped": 0}
     try:
         comp_table = get_table_client("competitions")
         if not comp_table:
             logging.error("Auto-deletion: storage configuration invalid")
-            return 0
+            return stats
 
         # One platform table client (and credential) for the whole sweep.
         platform_client, platform_error = None, None
@@ -1175,46 +1204,85 @@ def _run_cleanup_sweep(now: datetime) -> int:
             platform_error = f"platform clock unavailable ({type(exc).__name__})"
         clocks: dict[str, object] = {}  # platform id -> clock | None | PlatformClockUnavailable
 
-        for entity in list(comp_table.query_entities("PartitionKey eq 'GLOBAL'")):
-            if entity.get("Visible") is False:
-                continue
+        live = [e for e in comp_table.query_entities("PartitionKey eq 'GLOBAL'") if e.get("Visible") is not False]
+        bound_count = sum(1 for e in live if e.get("PlatformId"))
+        if platform_error:
+            # Never build a second client: the probe would fail the same way.
+            orphan_ok = False
+            orphan_reason = "off" if platform_error == "PLATFORM_STORAGE_ACCOUNT unset" else "unavailable"
+        else:
+            orphan_ok, orphan_reason = orphan_sweep_allowed(platform_client, bound_count)
+        if not orphan_ok:
+            logging.error(f"Auto-deletion: orphan step aborted for this run (platform clock {orphan_reason}; "
+                          f"{bound_count} bound record(s))")
+
+        def delete(entity, counter, what):
+            row_id = entity["RowKey"]
+            try:
+                _delete_competition_data(entity, AUTO_CLEANUP_ACTOR)
+                stats[counter] += 1
+                logging.info(f"Auto-deleted {what} competition {row_id}")
+            except Exception as e:
+                stats["failed"] += 1
+                logging.error(f"Auto-deletion failed for {row_id}: {e}")
+
+        def handle_orphan(entity, why):
+            row_id = entity["RowKey"]
+            if not orphan_ok:
+                stats["orphan_skipped"] += 1
+                return
+            if not orphan_old_enough(_orphan_reference(entity), now):
+                stats["orphan_kept"] += 1
+                logging.warning(f"Auto-deletion: {row_id} is orphaned ({why}) but not 60 days old; kept")
+                return
+            if not purge:
+                stats["orphan_dry_run"] += 1
+                logging.warning(f"Auto-deletion: dry run, would delete orphaned competition {row_id} ({why})")
+                return
+            delete(entity, "orphaned", f"orphaned ({why})")
+
+        for entity in live:
             row_id = entity["RowKey"]
             platform_id = entity.get("PlatformId")
 
             if not platform_id:
                 _ensure_deletion_date(comp_table, entity)
                 deletion = _parse_iso_utc(entity.get("DeletionDate"))
-                due = deletion is not None and deletion <= now
-            elif platform_error:
+                if deletion is not None and deletion <= now:
+                    delete(entity, "deleted", "expired")
+                else:
+                    handle_orphan(entity, "no PlatformId")
+                continue
+            if normalize_platform_id(platform_id) is None:
+                handle_orphan(entity, "PlatformId is not a GUID")
+                continue
+            if platform_error:
+                stats["skipped"] += 1
                 logging.error(f"Auto-deletion: {platform_error}; {row_id} skipped")
                 continue
-            else:
-                if platform_id not in clocks:
-                    try:
-                        clocks[platform_id] = read_platform_clock(platform_id, table_client=platform_client)
-                    except PlatformClockUnavailable as exc:
-                        clocks[platform_id] = exc
-                clock = clocks[platform_id]
-                if isinstance(clock, PlatformClockUnavailable):
-                    logging.error(f"Auto-deletion: platform clock unavailable for {row_id}; skipped until the next run")
-                    continue
-                if clock is None:
-                    logging.warning(f"Auto-deletion: no platform clock row for {row_id}; kept")
-                    continue
-                due = platform_says_delete(clock)
-                if not due:
-                    _sync_local_deletion_date(comp_table, entity, clock)
-
-            if not due:
+            if platform_id not in clocks:
+                try:
+                    clocks[platform_id] = read_platform_clock(platform_id, table_client=platform_client)
+                except PlatformClockUnavailable as exc:
+                    clocks[platform_id] = exc
+            clock = clocks[platform_id]
+            if isinstance(clock, PlatformClockUnavailable):
+                stats["skipped"] += 1
+                logging.error(f"Auto-deletion: platform clock unavailable for {row_id}; skipped until the next run")
                 continue
-            try:
-                _delete_competition_data(entity, AUTO_CLEANUP_ACTOR)
-                deleted += 1
-                logging.info(f"Auto-deleted expired competition {row_id} ({entity.get('Name', '?')})")
-            except Exception as e:
-                logging.error(f"Auto-deletion failed for {row_id}: {e}")
+            if clock is None:
+                handle_orphan(entity, "no platform clock row")
+                continue
+            if platform_says_delete(clock):
+                delete(entity, "deleted", "expired")
+            else:
+                _sync_local_deletion_date(comp_table, entity, clock)
 
-        logging.info(f"Auto-deletion sweep complete. Deleted {deleted} competition(s).")
+        logging.info(
+            f"Auto-deletion sweep complete. Deleted {stats['deleted']}, skipped {stats['skipped']} "
+            f"(platform clock unreadable), failed {stats['failed']}. Orphans: deleted {stats['orphaned']}, "
+            f"kept (under 60 days) {stats['orphan_kept']}, dry run {stats['orphan_dry_run']}, "
+            f"skipped (step aborted) {stats['orphan_skipped']}.")
         try:
             scrubbed = _scrub_hidden_rows(comp_table)
             if scrubbed:
@@ -1223,4 +1291,4 @@ def _run_cleanup_sweep(now: datetime) -> int:
             logging.error(f"Scrubbing deleted competitions failed: {e}")
     except Exception as e:
         logging.error(f"Auto-deletion sweep error: {e}")
-    return deleted
+    return stats

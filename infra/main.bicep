@@ -25,6 +25,11 @@ param proxySharedSecret string = ''
 // (TOOL_PRINCIPAL_ID_SCOREMODIFIER).
 param platformStorageAccountName string = ''
 
+// Nightly orphan step: true = delete orphaned records older than 60 days,
+// false = dry run (logs only) — the kill switch (GitHub variable
+// ORPHAN_PURGE_ENABLED=false). See modules/function.bicep.
+param orphanPurgeEnabled bool = true
+
 resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = {
   name: resourceGroupName
   location: location
@@ -48,6 +53,8 @@ module function 'modules/function.bicep' = {
     functionAppName: 'func-fs-scoremodifier-${uniqueString(rg.id)}'
     appServicePlanName: 'asp-fs-scoremodifier'
     appInsightsName: 'ai-fs-scoremodifier'
+    // rg-fs-scoremodifier-<env> -> log-fs-scoremodifier-<env>
+    logAnalyticsWorkspaceName: 'log-fs-scoremodifier-${last(split(resourceGroupName, '-'))}'
     storageAccountName: storage.outputs.storageAccountName
     deploymentContainerUrl: 'https://${storage.outputs.storageAccountName}.blob.${environment().suffixes.storage}/app-package'
     // No CORS: the browser never talks to the Function App directly, only the
@@ -55,6 +62,7 @@ module function 'modules/function.bicep' = {
     allowedOrigins: []
     proxySharedSecret: proxySharedSecret
     platformStorageAccountName: platformStorageAccountName
+    orphanPurgeEnabled: orphanPurgeEnabled
   }
 }
 
@@ -70,6 +78,7 @@ module roleAssignment 'modules/roleassignment.bicep' = {
 output resourceGroupName string = rg.name
 output storageAccountName string = storage.outputs.storageAccountName
 output functionAppName string = function.outputs.functionAppName
+output orphanPurgeEnabled bool = orphanPurgeEnabled
 // Consumed by the site repo (GitHub environment var TOOL_PRINCIPAL_ID_SCOREMODIFIER)
 // to grant this Function App read access to the shared competition-data container.
 output functionPrincipalId string = function.outputs.functionPrincipalId
