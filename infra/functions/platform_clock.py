@@ -24,11 +24,21 @@ Failure semantics (fail safe — never delete because something was unreadable):
 - Clock row not found -> read_platform_clock() returns None.
 - Table missing (TableNotFound) or any other error -> PlatformClockUnavailable;
   callers skip the record (timer) or refuse a new binding (503).
+
+Orphans (records the platform can no longer decide about). A live record is
+orphaned when it has no PlatformId (or one that is not a GUID), or when a
+successful read of its clock row found none. An orphan older than
+ORPHAN_MIN_AGE_DAYS (by its created time; without one, by the newest timestamp
+it has — record_age_reference) is deleted like a platform "deleted" verdict.
+Before any of that, orphan_sweep_allowed() probes the clock table once per
+sweep: unreadable, unconfigured, or holding zero rows while the tool has
+bound records (wrong table/account) -> the orphan step is aborted for the run.
+A read error on a single record is never "not found": that record is skipped.
 """
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import TableClient
@@ -36,6 +46,8 @@ from azure.identity import DefaultAzureCredential
 
 PLATFORM_CLOCK_TABLE_DEFAULT = "retentionclock"
 CLOCK_PARTITION = "COMPETITION"
+# An orphaned record (see the module docstring) younger than this is never touched.
+ORPHAN_MIN_AGE_DAYS = 60
 _GUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -133,3 +145,62 @@ def platform_says_delete(clock):
 
 def to_iso_z(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def clock_table_has_rows(table_client=None):
+    """
+    True when the clock table holds at least one competition row, False when
+    a successful read found none, None when PLATFORM_STORAGE_ACCOUNT is unset.
+    Raises PlatformClockUnavailable on any failure (missing table included).
+    """
+    try:
+        client = table_client or get_platform_table_client()
+    except Exception as exc:  # credential / client construction
+        raise PlatformClockUnavailable(type(exc).__name__) from exc
+    if client is None:
+        return None
+    try:
+        rows = client.query_entities(
+            f"PartitionKey eq '{CLOCK_PARTITION}'", select=["RowKey"], results_per_page=1)
+        for _row in rows:
+            return True
+        return False
+    except Exception as exc:
+        logging.error("Platform clock probe failed: %s", type(exc).__name__)
+        raise PlatformClockUnavailable(type(exc).__name__) from exc
+
+
+def orphan_sweep_allowed(table_client, bound_record_count):
+    """
+    (allowed, reason) for this run's orphan step. Refused when the clock is
+    unconfigured ("off") or unreadable ("unavailable"), or holds no rows at all
+    while the tool has bound records ("empty" — a sign of a wrong table or
+    account, under which every bound record would look orphaned).
+    """
+    try:
+        has_rows = clock_table_has_rows(table_client)
+    except PlatformClockUnavailable:
+        return False, "unavailable"
+    if has_rows is None:
+        return False, "off"
+    if not has_rows and bound_record_count > 0:
+        return False, "empty"
+    return True, "ok"
+
+
+def record_age_reference(created, *other_timestamps):
+    """
+    The time an orphan's age counts from: its created time, or — when it has
+    none that parses — the newest of its other timestamps. None when it has
+    no usable timestamp at all (such a record is never treated as old).
+    """
+    reference = parse_utc(created)
+    if reference is not None:
+        return reference
+    others = [dt for dt in (parse_utc(value) for value in other_timestamps) if dt is not None]
+    return max(others) if others else None
+
+
+def orphan_old_enough(reference, now, min_age_days=ORPHAN_MIN_AGE_DAYS):
+    """True when `reference` (aware UTC) lies more than `min_age_days` before `now`."""
+    return reference is not None and reference < now - timedelta(days=min_age_days)

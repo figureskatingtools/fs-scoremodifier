@@ -26,7 +26,12 @@ everyone outside the podium. Currently used for the **Tulokkaat (Beginners)** ca
 | **Backend** | Python Azure Functions (Flex Consumption, HTTP) — `generate` endpoint calls the core |
 | **Auth** | Microsoft Entra ID Easy Auth on the site router; this app trusts `X-Proxy-Secret` + `X-Forwarded-User-Email` |
 | **Storage** | Azure Blob Storage (uploaded + generated PDFs) + Table Storage (`competitions`, `generatedpapers`) |
-| **Infra** | Azure Bicep (subscription-scoped), own storage account — storage + Function App + RBAC only |
+| **Infra** | Azure Bicep (subscription-scoped), own storage account — storage + Function App (App Insights on a 90-day Log Analytics workspace) + RBAC only |
+
+**Retention.** A competition's files and the creator's e-mail address are deleted when its
+competition is deleted on figureskatingtools.com (anonymous usage statistics stay). A record no
+competition stands behind any more (or one from before the shared competitions) is deleted the same
+way once it is more than 60 days old. Logs are kept 90 days.
 
 The tool page is a single view: upload the PDF, tick **Include ranks** (off by default — non-podium
 ranks are hidden), click **Generate**, download the result. Each run is persisted (source + output
@@ -54,9 +59,13 @@ CI (`.github/workflows/deploy.yml`) deploys infra (Bicep) → backend on **push 
 
 Manual:
 ```bash
-./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>]
+./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>] [--platform-storage <ACCOUNT>] [--orphan-purge true|false]
 ./deploy_backend.sh -g <resource-group>
 ```
+
+Without `--orphan-purge`, `deploy_infra.sh` keeps the Function App's current `ORPHAN_PURGE_ENABLED`
+(the nightly orphan deletion); if it can't read it (no app yet, no permission) it deploys `false`
+(dry run) and says so, so a manual run never re-enables a purge the workflow deployed off.
 
 ### One-time setup
 1. Create GitHub Environments `test` and `prod` with:
@@ -102,6 +111,14 @@ deploy_infra.sh, deploy_backend.sh
 .github/workflows/deploy.yml
 ```
 
-## License
+## Licence
 
-PyMuPDF is licensed AGPL-3.0.
+The source code is licensed under the GNU Affero General Public License, version 3 only (SPDX:
+`AGPL-3.0-only`); see [LICENSE](LICENSE).
+
+The figureskatingtools name, logo and document templates (including
+`scoremodifier/assets/logo.png`) are not covered by this licence and remain the property of
+their owner; all rights reserved.
+
+The bundled Raleway fonts in `scoremodifier/assets/` keep their own licence, the SIL Open Font
+License 1.1 (`Raleway-OFL.txt`). PyMuPDF, which this tool uses, is itself licensed AGPL-3.0.
