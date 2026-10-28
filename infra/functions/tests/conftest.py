@@ -212,6 +212,21 @@ class _PlatformTableClient:
             raise exc from None
 
 
+    def query_entities(self, query_filter, select=None, **kwargs):
+        """The sweep's orphan-step probe (platform_clock.clock_table_has_rows)."""
+        pf = self.pf
+        pf.queries += 1
+        if pf.unreachable:
+            raise HttpResponseError("platform registry unreachable")
+        if pf.table_missing:
+            exc = ResourceNotFoundError("The table specified does not exist. ErrorCode:TableNotFound")
+            exc.error_code = "TableNotFound"
+            raise exc
+        m = _PK_FILTER.fullmatch(query_filter)
+        assert m, f"fake platform table only supports PartitionKey filters, got {query_filter!r}"
+        return [dict(v) for (p, _), v in pf.rows.items() if p == m.group(1)]
+
+
 class FakePlatform:
     """The site's platform clock table (`retentionclock`, PK "COMPETITION", RK guid)."""
 
@@ -221,6 +236,7 @@ class FakePlatform:
         self.table_missing = False
         self.clients = 0  # get_platform_table_client() calls
         self.reads = 0  # get_entity() calls
+        self.queries = 0  # query_entities() calls (the orphan-step probe)
 
     def add(self, guid, *, deletion, status="active", purged=None):
         row = {"PartitionKey": "COMPETITION", "RowKey": guid.lower(), "Status": status, "DeletionDate": deletion}

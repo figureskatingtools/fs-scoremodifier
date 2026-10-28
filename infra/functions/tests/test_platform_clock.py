@@ -312,7 +312,8 @@ def test_sweep_refreshes_the_cached_date(storage, platform):
     assert storage.competitions[("GLOBAL", "bbbbbbbb")]["DeletionDate"] == _z(_midnight(7))
 
 
-def test_sweep_keeps_rows_without_a_platform_clock_row(storage, platform, caplog):
+def test_sweep_keeps_rows_without_a_platform_clock_row_under_60_days(storage, platform, caplog):
+    platform.add(THIRD_GUID, deletion=_z(_midnight(30)))  # the clock table itself is healthy
     _seed(storage, "aaaaaaaa", local_days=-5, platform_id=GUID)  # overdue cached copy
     _seed(storage, "bbbbbbbb", platform_id=OTHER_GUID)  # no cached date
     with caplog.at_level(logging.WARNING):
@@ -379,3 +380,175 @@ def test_sweep_uses_one_client_and_one_read_per_competition(storage, platform):
     _sweep()
     assert platform.clients == 1
     assert platform.reads == 2
+
+
+# ── orphans: no platform competition behind the record ───────────────────────
+
+NOW = datetime.now(timezone.utc)
+OLD = _z(NOW - timedelta(days=61))
+YOUNG = _z(NOW - timedelta(days=59))
+
+
+@pytest.fixture
+def purge(monkeypatch):
+    monkeypatch.setenv("ORPHAN_PURGE_ENABLED", "true")
+
+
+def _orphan(storage, comp_id, created, *, platform_id="", local_days=30, **extra):
+    folder = _seed(storage, comp_id, local_days=local_days, platform_id=platform_id)
+    storage.competitions[("GLOBAL", comp_id)].update(
+        {"CreatedDate": created, "UploadedFileCount": 1, "GenerateRunCount": 3, "OutputPages": 12, **extra})
+    storage.papers[(comp_id, "per-skater.pdf")] = {"PartitionKey": comp_id, "RowKey": "per-skater.pdf",
+                                                   "FileName": "per-skater.pdf"}
+    return folder
+
+
+def _run():
+    return fa._run_cleanup_sweep(datetime.now(timezone.utc))
+
+
+def _assert_scrubbed(storage, comp_id, folder):
+    row = storage.competitions[("GLOBAL", comp_id)]
+    assert row["Visible"] is False
+    assert row["CreatedBy"] == "" and row["DeletedBy"] == fa.AUTO_CLEANUP_ACTOR
+    assert "@" not in repr(row)
+    # Statistics stay.
+    assert row["UploadedFileCount"] == 1 and row["GenerateRunCount"] == 3 and row["OutputPages"] == 12
+    assert not any(b.startswith(f"{folder}/") for b in storage.blobs)
+    assert (comp_id, "per-skater.pdf") not in storage.papers
+
+
+def test_old_record_without_platform_id_is_deleted_and_scrubbed(storage, platform, purge):
+    platform.add(THIRD_GUID, deletion=_z(_midnight(30)))
+    folder = _orphan(storage, "aaaaaaaa", OLD)  # its stored legacy date is still ahead
+
+    stats = _run()
+
+    assert stats["orphaned"] == 1 and stats["deleted"] == 0
+    _assert_scrubbed(storage, "aaaaaaaa", folder)
+
+
+def test_old_record_whose_clock_row_is_not_found_is_deleted_and_scrubbed(storage, platform, purge):
+    platform.add(THIRD_GUID, deletion=_z(_midnight(30)))
+    folder = _orphan(storage, "aaaaaaaa", OLD, platform_id=GUID)
+
+    assert _run()["orphaned"] == 1
+    _assert_scrubbed(storage, "aaaaaaaa", folder)
+
+
+def test_a_platform_id_that_is_not_a_guid_counts_as_orphaned(storage, platform, purge):
+    platform.add(THIRD_GUID, deletion=_z(_midnight(30)))
+    folder = _orphan(storage, "aaaaaaaa", OLD, platform_id="not-a-guid")
+
+    assert _run()["orphaned"] == 1
+    _assert_scrubbed(storage, "aaaaaaaa", folder)
+
+
+@pytest.mark.parametrize("platform_id", ["", GUID])
+def test_orphan_younger_than_60_days_is_untouched(storage, platform, purge, platform_id):
+    platform.add(THIRD_GUID, deletion=_z(_midnight(30)))
+    _orphan(storage, "aaaaaaaa", YOUNG, platform_id=platform_id)
+
+    stats = _run()
+
+    assert stats["orphaned"] == 0 and stats["orphan_kept"] == 1
+    row = storage.competitions[("GLOBAL", "aaaaaaaa")]
+    assert row["Visible"] is True and row["CreatedBy"] == "x@y"
+
+
+def test_without_a_created_date_the_newest_timestamp_counts(storage, platform, purge):
+    platform.add(THIRD_GUID, deletion=_z(_midnight(30)))
+    _orphan(storage, "aaaaaaaa", "-", platform_id=GUID)  # no timestamp at all: never "old"
+    _orphan(storage, "bbbbbbbb", "-", platform_id=GUID, DeletedDate=OLD)
+
+    stats = _run()
+
+    assert stats["orphaned"] == 1 and stats["orphan_kept"] == 1
+    assert _visible(storage, "aaaaaaaa") is True and _visible(storage, "bbbbbbbb") is False
+
+
+def test_a_clock_read_error_is_never_not_found(storage, platform, purge, monkeypatch):
+    platform.add(THIRD_GUID, deletion=_z(_midnight(30)))
+    _orphan(storage, "aaaaaaaa", OLD, platform_id=GUID)
+
+    def throttled(guid, table_client=None):
+        raise pc.PlatformClockUnavailable("HttpResponseError")
+    monkeypatch.setattr(fa, "read_platform_clock", throttled)
+
+    stats = _run()
+
+    assert stats["orphaned"] == 0 and stats["skipped"] == 1
+    assert storage.competitions[("GLOBAL", "aaaaaaaa")]["CreatedBy"] == "x@y"
+
+
+def test_an_empty_clock_table_aborts_the_orphan_step(storage, platform, purge, caplog):
+    # Zero clock rows while bound records exist: the wrong table or account.
+    _orphan(storage, "aaaaaaaa", OLD, platform_id=GUID)
+    _orphan(storage, "bbbbbbbb", OLD)
+
+    with caplog.at_level(logging.ERROR):
+        stats = _run()
+
+    assert stats["orphaned"] == 0 and stats["orphan_skipped"] == 2
+    assert _visible(storage, "aaaaaaaa") is True and _visible(storage, "bbbbbbbb") is True
+    assert any("orphan step aborted" in r.getMessage() and "empty" in r.getMessage() for r in caplog.records)
+
+
+def test_an_empty_clock_table_is_fine_when_nothing_is_bound(storage, platform, purge):
+    _orphan(storage, "bbbbbbbb", OLD)
+
+    assert _run()["orphaned"] == 1
+
+
+@pytest.mark.parametrize("failure", ["unreachable", "table_missing"])
+def test_an_unreadable_clock_table_aborts_the_orphan_step(storage, platform, purge, failure):
+    setattr(platform, failure, True)
+    _orphan(storage, "bbbbbbbb", OLD)
+
+    stats = _run()
+
+    assert stats["orphaned"] == 0 and stats["orphan_skipped"] == 1
+    assert _visible(storage, "bbbbbbbb") is True
+
+
+def test_without_a_registry_configured_the_orphan_step_is_aborted(storage, purge):
+    _orphan(storage, "bbbbbbbb", OLD)
+
+    stats = _run()
+
+    assert stats["orphaned"] == 0 and stats["orphan_skipped"] == 1
+
+
+def test_a_live_bound_record_is_untouched(storage, platform, purge):
+    _orphan(storage, "aaaaaaaa", OLD, platform_id=GUID)
+    platform.add(GUID, deletion=_z(_midnight(5)))
+
+    stats = _run()
+
+    assert stats["orphaned"] == 0 and stats["deleted"] == 0
+    row = storage.competitions[("GLOBAL", "aaaaaaaa")]
+    assert row["Visible"] is True and row["CreatedBy"] == "x@y"
+
+
+def test_the_kill_switch_only_logs(storage, platform, monkeypatch, caplog):
+    monkeypatch.setenv("ORPHAN_PURGE_ENABLED", "false")
+    platform.add(THIRD_GUID, deletion=_z(_midnight(30)))
+    _orphan(storage, "aaaaaaaa", OLD, platform_id=GUID)
+
+    with caplog.at_level(logging.WARNING):
+        stats = _run()
+
+    assert stats["orphaned"] == 0 and stats["orphan_dry_run"] == 1
+    assert _visible(storage, "aaaaaaaa") is True
+    assert any("would delete" in r.getMessage() for r in caplog.records)
+
+
+def test_the_timer_logs_the_orphan_counts(storage, platform, purge, caplog):
+    platform.add(THIRD_GUID, deletion=_z(_midnight(30)))
+    _orphan(storage, "aaaaaaaa", OLD, platform_id=GUID)
+
+    with caplog.at_level(logging.INFO):
+        _sweep()
+
+    assert _visible(storage, "aaaaaaaa") is False
+    assert any("Orphans: deleted 1" in r.getMessage() for r in caplog.records)

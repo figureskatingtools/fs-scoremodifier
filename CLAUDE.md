@@ -54,7 +54,8 @@ python3.13 -m venv .venv && source .venv/bin/activate && pip install -r requirem
 ln -s ../../scoremodifier scoremodifier && func start   # the symlink is gitignored
 
 # Deployment (manual; CI does this automatically — see Branch / Deploy Strategy)
-./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>]
+./deploy_infra.sh -g <resource-group> [--proxy-secret <SECRET>] [--platform-storage <ACCOUNT>] [--orphan-purge true|false]
+# --orphan-purge omitted = keep the deployed ORPHAN_PURGE_ENABLED (false if unreadable), never the Bicep default true
 ./deploy_backend.sh -g <resource-group>     # bundles the core package + pip installs (needs python3.13 or PYTHON=…), ZIP deploy
 ```
 
@@ -136,7 +137,8 @@ Four pieces:
    resource group, **own storage account** (`stfsscore…`, container `fs-scoremodifier`, tables
    `competitions` + `generatedpapers`, plus the `app-package` deploy container — no `categories`
    table), Flex Consumption Function App (system-assigned identity, CORS empty, `PLATFORM_STORAGE_ACCOUNT`
-   app setting from the `platformStorageAccountName` param), App Insights, and
+   app setting from the `platformStorageAccountName` param, `ORPHAN_PURGE_ENABLED` from
+   `orphanPurgeEnabled`), App Insights on a 90-day Log Analytics workspace, and
    RBAC (Blob Data Contributor + Table Data Contributor + Blob Delegator). No Web App, no auth
    managed identity, no DNS and no custom domain — those moved to the site repo. `main.bicep` exports
    `functionAppName` + `functionPrincipalId`, which the site repo consumes as its
@@ -206,15 +208,31 @@ fs-judgepapers and fs-protocolgenerator** (its docstring is the contract).
 - **Sweep** (`auto_delete_expired_competitions` → `_run_cleanup_sweep`, **04:00 UTC**, after the
   platform's 03:00 sweep): one platform table client per run, one read per GUID. Bound rows are
   deleted **only on the platform's verdict** (`platform_says_delete`: `Status == "deleted"` or
-  `PurgedUtc` — never a date alone), otherwise their cached date is refreshed; no clock row → kept
-  with `logging.warning`; platform unreadable or `PLATFORM_STORAGE_ACCOUNT` unset → **skipped with
-  `logging.error`, never deleted**. Legacy rows without a `PlatformId` are deleted on their stored
-  date (old 30-day rows keep it; `_ensure_deletion_date` backfills `LEGACY_DELETION_DATE` on legacy
-  rows only, in list, details and the sweep alike).
+  `PurgedUtc` — never a date alone), otherwise their cached date is refreshed; platform unreadable
+  or `PLATFORM_STORAGE_ACCOUNT` unset → **skipped with `logging.error`, never deleted**. Legacy rows
+  without a `PlatformId` are deleted on their stored date (old 30-day rows keep it;
+  `_ensure_deletion_date` backfills `LEGACY_DELETION_DATE` on legacy rows only, in list, details and
+  the sweep alike).
+- **Orphans** (the platform can no longer decide about them): a live row with no `PlatformId` (or a
+  non-GUID one), or whose clock row a *successful* read did not find, is deleted with the same
+  `_delete_competition_data` flow (files gone, `CreatedBy` blanked, statistics kept) once it is
+  **more than 60 days old** (`CreatedDate`; without one, the newest of `DeletedDate`/the Table
+  `Timestamp` — `platform_clock.record_age_reference`); younger orphans are kept with a warning, and
+  a read error is never "not found" (skipped). Safety rails: one probe of the clock table per run
+  (`platform_clock.orphan_sweep_allowed`) — unreadable, unconfigured, or **zero rows while the tool
+  has bound rows** (wrong table/account) → the orphan step is aborted for that run with an error log;
+  `ORPHAN_PURGE_ENABLED` (Bicep param `orphanPurgeEnabled`, default on; GitHub var
+  `ORPHAN_PURGE_ENABLED=false` = kill switch) off → it only logs "would delete". The sweep returns and
+  logs the per-run counts (`deleted`, `skipped`, `failed`, `orphaned`, `orphan_kept`,
+  `orphan_dry_run`, `orphan_skipped`).
 - **No e-mail addresses on deleted rows:** deletion merges `CreatedBy=""` and
   `DeletedBy="user"|"auto-cleanup"`; every sweep also runs `_scrub_hidden_rows()`, blanking any
-  other `CreatedBy`/`DeletedBy` value on `Visible=false` rows. Logs never carry addresses (the
-  no-identity warning lists header names only).
+  other `CreatedBy`/`DeletedBy` value on `Visible=false` rows. `CreatedBy` is the only user
+  identifier this tool stores (no blob metadata, nothing in `generatedpapers`). Logs never carry
+  addresses (the no-identity warning lists header names only) and are kept **90 days**:
+  `function.bicep` links App Insights to its own Log Analytics workspace
+  `log-fs-scoremodifier-<env>` (`retentionInDays: 90`) and sets `RetentionInDays: 90` on the
+  component (`logRetentionDays`).
 
 ## Site integration
 
@@ -270,7 +288,8 @@ grouped weekly, with PRs against `main` like any feature branch.
    judgepapers deploy app can be reused by adding an `fs-scoremodifier` federated-credential subject),
    `PROXY_SHARED_SECRET`. **Variables**: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `LOCATION`,
    `RESOURCE_GROUP_NAME`, `PLATFORM_STORAGE_ACCOUNT` (the site's `stfsplat*` account for that
-   environment — same value as fs-judgepapers'; empty = bound rows are never deleted). (`AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID` and `CUSTOM_DOMAIN` are obsolete —
+   environment — same value as fs-judgepapers'; empty = bound rows are never deleted), optional
+   `ORPHAN_PURGE_ENABLED` (`false` = the nightly orphan step only logs; unset = on). (`AUTH_CLIENT_ID`, `AUTH_APP_OBJECT_ID` and `CUSTOM_DOMAIN` are obsolete —
    delete them once the old Web App is gone.)
 2. Run the deploy workflow (`test` via `workflow_dispatch`).
 3. Copy the job summary's `functionAppName` / `functionPrincipalId` into the `figureskatingtools-site`
