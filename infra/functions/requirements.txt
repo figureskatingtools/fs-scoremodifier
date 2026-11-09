@@ -3,9 +3,9 @@
 # built for >=3.13 and is API-identical to 1.x. Do not drop back to 1.x — that
 # line is for 3.10–3.12 hosts only.
 azure-functions~=2.3.0
-azure-storage-blob~=12.31.0
-azure-identity~=1.26.0
+azure-storage-blob~=12.31.1
+azure-identity~=1.27.0
 azure-data-tables~=12.7.0
 # Must stay in step with the repo-root requirements.txt (the CLI renders with
 # the same package; a split pin is a silent rendering difference).
-pymupdf~=2.0.0
+pymupdf~=2.1.0
