@@ -2,7 +2,7 @@
 # workflow's setup-python), so azure-functions stays on the 2.x line: 2.x is
 # built for >=3.13 and is API-identical to 1.x. Do not drop back to 1.x — that
 # line is for 3.10–3.12 hosts only.
-azure-functions~=2.3.0
+azure-functions~=2.4.0
 azure-storage-blob~=12.31.1
 azure-identity~=1.27.0
 azure-data-tables~=12.7.0
