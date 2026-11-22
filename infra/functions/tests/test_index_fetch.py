@@ -4,6 +4,9 @@ No network: DNS (`_resolve`) and the HTTPS connection (`_open_connection`) are
 replaced by fakes that serve scripted responses per (host, path).
 """
 
+import threading
+import time
+
 import pytest
 
 from scoremodifier import index_meta as im
@@ -28,11 +31,25 @@ class FakeResponse:
         chunk, self._body = (self._body, b"") if amt is None else (self._body[:amt], self._body[amt:])
         return chunk
 
+    read1 = read
+
+
+class FakeSock:
+    def __init__(self):
+        self.timeouts = []
+        self.shut = threading.Event()
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def shutdown(self, how):
+        self.shut.set()
+
 
 class FakeConnection:
     def __init__(self, net, host, port, ip):
         self.net, self.host, self.port, self.ip = net, host, port, ip
-        self.sock = None
+        self.sock = self.fake_sock = FakeSock()
         self.closed = False
 
     def request(self, method, target, headers=None):
@@ -40,7 +57,12 @@ class FakeConnection:
         self.target = target
 
     def getresponse(self):
-        return self.net.routes[(self.host, self.target)]()
+        resp = self.net.routes[(self.host, self.target)]()
+        resp.sock = self.fake_sock
+        # Like http.client for a closing response: the connection forgets
+        # its socket, the response keeps reading from it.
+        self.sock = None
+        return resp
 
     def close(self):
         self.closed = True
@@ -253,3 +275,119 @@ def test_cli_mode_still_enforces_https_and_public_addresses(net):
         im.fetch_index_html("https://intranet.local/index.htm", allowed_hosts=None)
     with pytest.raises(im.IndexUrlRejected):
         im.fetch_index_html("ftp://intranet.local/index.htm", allowed_hosts=None)
+
+
+# ── deadline, address fallback (review follow-ups) ────────────────────────────
+
+def test_next_checked_address_is_tried_without_resolving_again(net, monkeypatch):
+    v6, v4 = "2a00:1450:4010:c0e::64", PUBLIC_IP
+    net.dns["www.figureskatingresults.fi"] = [v6, v4]
+    lookups, attempts = [], []
+    monkeypatch.setattr(im, "_resolve", lambda host, port: lookups.append(host) or net.dns[host])
+
+    def open_(host, port, ip, timeout):
+        attempts.append(ip)
+        if ip == v6:
+            raise OSError("network unreachable")
+        return net.open(host, port, ip, timeout)
+
+    monkeypatch.setattr(im, "_open_connection", open_)
+    net.serve("www.figureskatingresults.fi", "/r/index.htm", body=INDEX)
+    assert fetch("https://www.figureskatingresults.fi/r/index.htm") == INDEX.decode()
+    assert attempts == [v6, v4]
+    assert lookups == ["www.figureskatingresults.fi"]
+    assert net.requests[0][3] == v4
+
+
+def test_all_addresses_unreachable_is_a_fetch_error(net, monkeypatch):
+    net.dns["www.figureskatingresults.fi"] = [PUBLIC_IP, "2a00:1450:4010:c0e::64"]
+    attempts = []
+
+    def refuse(host, port, ip, timeout):
+        attempts.append(ip)
+        raise ConnectionRefusedError()
+
+    monkeypatch.setattr(im, "_open_connection", refuse)
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch("https://www.figureskatingresults.fi/r/index.htm")
+    assert e.value.code == "unreachable_ConnectionRefusedError"
+    assert attempts == net.dns["www.figureskatingresults.fi"]
+
+
+def test_slow_dns_is_bounded_and_cannot_answer_a_later_lookup(net, monkeypatch):
+    monkeypatch.setattr(im, "TOTAL_TIMEOUT", 0.3)
+    release, calls = threading.Event(), []
+
+    def resolve(host, port):
+        calls.append(host)
+        if len(calls) == 1:
+            release.wait(5)
+            return ["10.0.0.1"]  # a late, poisoned answer
+        return [PUBLIC_IP]
+
+    monkeypatch.setattr(im, "_resolve", resolve)
+    net.serve("www.figureskatingresults.fi", "/r/index.htm", body=INDEX)
+    started = time.monotonic()
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch("https://www.figureskatingresults.fi/r/index.htm")
+    assert e.value.code == "timeout"
+    assert time.monotonic() - started < 2
+    assert net.connections == []
+
+    release.set()
+    time.sleep(0.05)  # the abandoned lookup finishes now
+    assert fetch("https://www.figureskatingresults.fi/r/index.htm") == INDEX.decode()
+    assert net.requests[-1][3] == PUBLIC_IP
+
+
+class TrickleResponse(FakeResponse):
+    """One byte per read, each read costing a second of (fake) time."""
+
+    def __init__(self, clock):
+        super().__init__(200, b"A" * 1000)
+        self.clock = clock
+
+    def read(self, amt=None):
+        self.clock[0] += 1.0
+        return super().read(1)
+
+    read1 = read
+
+
+def test_trickled_body_of_a_closing_response_stops_at_the_deadline(net, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(im, "_monotonic", lambda: clock[0])
+    resp = TrickleResponse(clock)
+    net.routes[("www.figureskatingresults.fi", "/slow")] = lambda: resp
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch("https://www.figureskatingresults.fi/slow")
+    assert e.value.code == "timeout"
+    assert clock[0] <= im.TOTAL_TIMEOUT + 1
+    # The deadline reached the socket even though the connection dropped it.
+    sock = net.connections[0].fake_sock
+    assert net.connections[0].sock is None
+    assert len(sock.timeouts) >= im.TOTAL_TIMEOUT - 1
+    assert all(0 < t <= 10.0 for t in sock.timeouts)
+    assert sock.timeouts[-1] <= 1.0
+
+
+class StalledResponse(FakeResponse):
+    """A read that blocks until the socket is shut down (a stalled server)."""
+
+    def read(self, amt=None):
+        if not self.sock.shut.wait(5):
+            return b"late"
+        raise OSError("socket shut down")
+
+    read1 = read
+
+
+def test_a_stalled_read_is_cut_off_at_the_deadline(net, monkeypatch):
+    monkeypatch.setattr(im, "TOTAL_TIMEOUT", 0.3)
+    net.routes[("www.figureskatingresults.fi", "/stall")] = lambda: StalledResponse(200)
+    started = time.monotonic()
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch("https://www.figureskatingresults.fi/stall")
+    assert e.value.code == "timeout"
+    assert time.monotonic() - started < 2
+    assert net.connections[0].fake_sock.shut.is_set()

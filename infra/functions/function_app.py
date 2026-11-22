@@ -855,22 +855,32 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
     # Proper-case category name from the index (e.g. "Tulokkaat L1") for the
     # native CAT###RS.htm caption; the `category` field above is the PDF badge.
     category_full = ""
+    idx = matched = None
     if index_url:
         try:
             idx = parse_index_html(fetch_index_html(index_url, allowed_hosts=INDEX_ALLOWED_HOSTS))
-            competition = competition or idx.competition
-            date = date or idx.date
-            venue = venue or idx.venue
-            matched = match_category(idx, segment)
-            if matched:
-                category = category or matched.name
-                cat_file = cat_file or matched.cat_file
-            # Caption name: prefer the explicitly selected CAT page, else the match.
-            selected = next((c for c in idx.categories if c.cat_file == cat_file), None) or matched
-            if selected:
-                category_full = selected.name
         except Exception as e:
             logging.warning(f"Could not use the index URL: {getattr(e, 'code', type(e).__name__)}")
+    if idx is not None:
+        competition = competition or idx.competition
+        date = date or idx.date
+        venue = venue or idx.venue
+        matched = match_category(idx, segment)
+        if matched:
+            category = category or matched.name
+            cat_file = cat_file or matched.cat_file
+
+    # One sanitised page name from here on — the caption lookup, the blob, the
+    # rows and the response. catFile is normally a CAT###RS.htm name from the
+    # index; anything else is reduced to a plain .htm/.html file name inside
+    # this record's folder.
+    html_filename = _safe_html_filename(cat_file)
+
+    if idx is not None:
+        # Caption name: prefer the explicitly selected CAT page, else the match.
+        selected = next((c for c in idx.categories if c.cat_file == html_filename), None) or matched
+        if selected:
+            category_full = selected.name
 
     meta = ResultsMeta(
         competition=competition,
@@ -889,10 +899,7 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Error rendering results: {e}", exc_info=True)
         return func.HttpResponse("Could not render the results page.", status_code=500)
 
-    # catFile is normally a CAT###RS.htm name from the index; anything else is
-    # reduced to a plain .htm/.html file name inside this record's folder.
-    html_filename = _safe_html_filename(cat_file)
-    name =" — ".join([x for x in (meta.category, meta.competition) if x]) or "Results"
+    name = " — ".join([x for x in (meta.category, meta.competition) if x]) or "Results"
 
     # Download filename for the results PDF. Tulokkaat re-uses the standard FSM
     # export name; other categories default to a generic name but the operator

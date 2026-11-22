@@ -248,3 +248,27 @@ def test_long_names_keep_the_folder_short(synthetic_pdf, storage, fake_results):
     assert resp.status_code == 200, resp.get_body()
     folder = storage.competitions[("GLOBAL", body["id"])]["FolderPath"]
     assert len(folder) <= fa.MAX_FOLDER_NAME + 1 + 8 and "/" not in folder
+
+
+@pytest.mark.parametrize("cat_file", ["../CAT003RS.htm", "../../x/CAT003RS.htm", "CAT003RS"])
+def test_normalised_cat_file_picks_its_own_caption(synthetic_pdf, storage, fake_results, monkeypatch, cat_file):
+    # The caption lookup uses the same normalised name as the stored page, so
+    # the page is never saved under one category's name with another's caption.
+    monkeypatch.setattr(fa, "fetch_index_html", lambda url, *, allowed_hosts=None, timeout=10.0: INDEX_HTML)
+    seen = {}
+    monkeypatch.setattr(fa, "render_results_html", lambda meta, teams: seen.setdefault("meta", meta) and "<html></html>")
+    resp, body = _run(synthetic_pdf, {"catFile": cat_file, "indexUrl": "https://www.figureskatingresults.fi/r/index.htm"})
+    assert resp.status_code == 200, resp.get_body()
+    assert body["htmlFileName"] == "CAT003RS.htm"
+    assert seen["meta"].category_full == "Noviisit L1"
+    row = storage.competitions[("GLOBAL", body["id"])]
+    assert row["CatFile"] == "CAT003RS.htm"
+    assert f"{row['FolderPath']}/output/CAT003RS.htm" in storage.blobs
+
+
+def test_blank_cat_file_still_auto_matches_from_the_index(synthetic_pdf, storage, fake_results, monkeypatch):
+    monkeypatch.setattr(fa, "fetch_index_html", lambda url, *, allowed_hosts=None, timeout=10.0: INDEX_HTML)
+    resp, body = _run(synthetic_pdf, {"indexUrl": "https://www.figureskatingresults.fi/r/index.htm"})
+    assert resp.status_code == 200, resp.get_body()
+    # fake_results' segment "TULOKKAAT" matches "Tulokkaat L1".
+    assert body["htmlFileName"] == "CAT001RS.htm"

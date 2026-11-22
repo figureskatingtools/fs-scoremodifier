@@ -17,6 +17,7 @@ import ipaddress
 import re
 import socket
 import ssl
+import threading
 import time
 from dataclasses import dataclass, field
 from html import unescape
@@ -234,10 +235,7 @@ def _get_once(parts, timeout: float, deadline: float):
             raise IndexFetchError("timeout")
         return min(timeout, left)
 
-    try:
-        addresses = _resolve(host, port)
-    except (OSError, UnicodeError):
-        raise IndexFetchError("unresolvable") from None
+    addresses = _resolve_within(host, port, remaining())
     if not addresses:
         raise IndexFetchError("unresolvable")
     if not all(_is_public_address(ip) for ip in addresses):
@@ -247,9 +245,32 @@ def _get_once(parts, timeout: float, deadline: float):
     if parts.query:
         target += "?" + quote(parts.query, safe=_URL_SAFE + "?")
 
-    conn = None
+    conn = sock = watchdog = None
+    fired = threading.Event()
     try:
-        conn = _open_connection(host, port, addresses[0], remaining())
+        # Every address was checked above; try them in order (e.g. an
+        # unreachable IPv6 answer before a working IPv4 one), never resolving
+        # the name again.
+        last_error = None
+        for ip in addresses:
+            try:
+                conn = _open_connection(host, port, ip, remaining())
+                break
+            except IndexFetchError:
+                raise
+            except Exception as e:  # refused, unreachable, TLS failure
+                last_error = e
+        if conn is None:
+            raise IndexFetchError(f"unreachable_{type(last_error).__name__}")
+        # Kept here: http.client drops conn.sock for a closing response, but
+        # the response still reads from this socket.
+        sock = getattr(conn, "sock", None)
+        # Hard stop at the deadline whatever the server does (slow headers,
+        # trickled body): shutting the socket down unblocks any pending read.
+        if sock is not None:
+            watchdog = threading.Timer(max(deadline - _monotonic(), 0.0), _abort_socket, (sock, fired))
+            watchdog.daemon = True
+            watchdog.start()
         conn.request("GET", target, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"})
         resp = conn.getresponse()
         status = resp.status
@@ -260,25 +281,68 @@ def _get_once(parts, timeout: float, deadline: float):
         length = (resp.getheader("Content-Length") or "").strip()
         if length.isdigit() and int(length) > MAX_INDEX_BYTES:
             raise IndexFetchError("too_large")
+        # read1: at most one read from the socket per call, so the deadline is
+        # checked between reads even when the server trickles bytes.
+        read = getattr(resp, "read1", None) or resp.read
         chunks, total = [], 0
         while True:
-            if getattr(conn, "sock", None) is not None:
-                conn.sock.settimeout(remaining())
-            chunk = resp.read(min(_READ_CHUNK, MAX_INDEX_BYTES + 1 - total))
+            left = remaining()
+            if sock is not None:
+                sock.settimeout(left)
+            chunk = read(min(_READ_CHUNK, MAX_INDEX_BYTES + 1 - total))
             if not chunk:
                 break
             chunks.append(chunk)
             total += len(chunk)
             if total > MAX_INDEX_BYTES:
                 raise IndexFetchError("too_large")
+        remaining()
         return status, None, b"".join(chunks)
     except IndexFetchError:
         raise
     except Exception as e:  # socket, TLS, HTTP protocol errors
+        if fired.is_set() or _monotonic() >= deadline:
+            raise IndexFetchError("timeout") from None
         raise IndexFetchError(f"unreachable_{type(e).__name__}") from None
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         if conn is not None:
             conn.close()
+
+
+def _abort_socket(sock, fired: threading.Event) -> None:
+    fired.set()
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+
+
+def _resolve_within(host: str, port: int, timeout: float) -> list[str]:
+    """``_resolve`` bounded by ``timeout``: getaddrinfo cannot be interrupted,
+    so it runs in a daemon thread and is abandoned when it is too slow. Each
+    call has its own result holder, so an abandoned lookup can never answer a
+    later one."""
+    box: dict = {}
+    done = threading.Event()
+
+    def work():
+        try:
+            box["addresses"] = list(_resolve(host, port))
+        except BaseException as e:  # reported to the waiting caller
+            box["error"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=work, name="index-dns", daemon=True).start()
+    if not done.wait(timeout):
+        raise IndexFetchError("timeout")
+    if "error" in box:
+        if isinstance(box["error"], (OSError, UnicodeError)):
+            raise IndexFetchError("unresolvable")
+        raise IndexFetchError(f"unresolvable_{type(box['error']).__name__}")
+    return box["addresses"]
 
 
 def match_category(meta: IndexMeta, segment: str) -> Category | None:
