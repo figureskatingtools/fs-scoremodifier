@@ -9,6 +9,9 @@ prefix is stripped; backend routes are unchanged).
 The Function App is publicly reachable and every route is
 `func.AuthLevel.ANONYMOUS`, so **all authentication and authorization ride on
 request headers set by the router**. Nothing else may call these endpoints.
+The app is `httpsOnly` (`infra/modules/function.bicep`), so the router's
+`FUNCTION_APP_URL_SCOREMODIFIER` must be the `https://` address: plain HTTP is
+redirected, never served.
 
 ## Headers
 
@@ -77,7 +80,19 @@ everywhere without a lookup.
 | `GET parse_index?url=`, `check_user_permission` | sign-in only (no competition) |
 | `GET health` | nothing |
 
-Records without a (valid) `PlatformId` are legacy rows: **admin only**.
+Records without a (valid) `PlatformId` are legacy rows: **admin only**. A
+record `id` that is not 1–64 letters, digits, `-` or `_` is an unknown record
+(404 `platform_not_found`) without any lookup.
+
+`parse_index` answers 400 with a fixed message (the URL is never echoed) for a
+link that is not `https` (an `http://` link on port 80 is upgraded), carries
+credentials or a non-default port, or is not on `INDEX_ALLOWED_HOSTS`; and one
+502 `Could not fetch the index page.` for every failure while fetching
+(unreachable, a redirect off the allow-list or to `http`, a non-public
+address, more than 3 redirects, a body over 2 MiB, 20 s total). The same
+fetch fills `generate_results`' blank fields from `indexUrl`; there a failure
+only skips the auto-fill. `generate_results` reduces `catFile`/`pdfFile` to a
+plain file name inside the record's own folder (see `CLAUDE.md`).
 
 | Situation | Response (JSON) |
 |---|---|

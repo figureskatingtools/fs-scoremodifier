@@ -3,7 +3,9 @@
 from .extract import extract_results
 from .index_meta import (
     Category,
+    IndexFetchError,
     IndexMeta,
+    IndexUrlRejected,
     fetch_index_html,
     match_category,
     parse_index_html,
@@ -32,5 +34,7 @@ __all__ = [
     "Category",
     "parse_index_html",
     "fetch_index_html",
+    "IndexFetchError",
+    "IndexUrlRejected",
     "match_category",
 ]
