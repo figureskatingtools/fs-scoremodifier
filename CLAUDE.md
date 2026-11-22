@@ -128,9 +128,11 @@ Four pieces:
    index.htm (SSRF-guarded to `INDEX_ALLOWED_HOSTS`, default `figureskatingresults.fi`) → name/date/venue
    + category `CAT###RS.htm` list. The guard (`index_meta.fetch_index_html`): https only (a pasted
    `http://` link on port 80 is upgraded before anything is sent), no credentials or non-443 port, every
-   DNS answer must be a public address (connects to the checked IP, SNI/cert on the name), redirects
-   followed by hand ≤ 3 hops with each re-checked (https + allow-list, no downgrade), body ≤ 2 MiB,
-   20 s total. A rejected URL is 400 with fixed wording (nothing echoed); every fetch failure is the
+   DNS answer must be a public address (connects to the checked IPs in order, never resolving again,
+   SNI/cert on the name), redirects followed by hand ≤ 3 hops with each re-checked (https +
+   allow-list, no downgrade), body ≤ 2 MiB, 20 s total — DNS included (lookup in a daemon thread,
+   abandoned at the deadline), the transfer cut by a watchdog that shuts the socket down at the
+   deadline, plus a deadline check before every `read1`. A rejected URL is 400 with fixed wording (nothing echoed); every fetch failure is the
    same 502. Tests: `tests/test_index_fetch.py` (fake DNS/connection, no network). `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
    and the daily auto-delete timer are mirrored from judgepapers for
    future features / storage hygiene (not wired to the current UI). The auth/storage/SAS helpers are reused verbatim from
