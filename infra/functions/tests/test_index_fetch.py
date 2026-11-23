@@ -725,6 +725,30 @@ def test_real_http_client_socket_is_closed_whatever_the_outcome(monkeypatch, sta
         client.close()
 
 
+@pytest.mark.parametrize("head, code", [
+    (b"Content-Length: %d\r\nContent-Length: %d\r\n" % (len(INDEX), len(INDEX)), None),   # repeated, same value
+    (b"Content-Length: %d, %d\r\n" % (len(INDEX), len(INDEX)), None),                     # same, as a list
+    (b"Content-Length: %d\r\nContent-Length: 5\r\n" % len(INDEX), "bad_content_length"),  # repeated, different
+    (b"Content-Length: 5\r\nContent-Length: %d\r\n" % len(INDEX), "bad_content_length"),
+    (b"Content-Length: 5, %d\r\n" % len(INDEX), "bad_content_length"),
+    (b"Content-Length: abc\r\n", "bad_content_length"),
+    (b"Content-Length: -1\r\n", "bad_content_length"),
+    (b"Content-Length: \xc2\xb2\r\n", "bad_content_length"),                               # a non-ASCII "digit"
+])
+def test_real_http_client_repeated_or_malformed_content_length(monkeypatch, head, code):
+    server, thread = _serve_once(monkeypatch, head + b"Connection: close\r\n", INDEX, close=True)
+    try:
+        if code is None:
+            assert fetch("https://www.figureskatingresults.fi/r/index.htm") == INDEX.decode()
+        else:
+            with pytest.raises(im.IndexFetchError) as e:
+                fetch("https://www.figureskatingresults.fi/r/index.htm")
+            assert e.value.code == code
+    finally:
+        thread.join(timeout=5)
+        server.close()
+
+
 def test_real_http_client_chunked_response_is_accepted(monkeypatch):
     body = b"%x\r\n" % len(INDEX) + INDEX + b"\r\n0\r\n\r\n"
     server, thread = _serve_once(monkeypatch, b"Transfer-Encoding: chunked\r\nConnection: close\r\n", body, close=True)

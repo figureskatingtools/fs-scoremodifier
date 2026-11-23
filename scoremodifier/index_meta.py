@@ -322,8 +322,7 @@ def _get_once(parts, timeout: float, deadline: float):
             return status, resp.getheader("Location"), b""
         if status != 200:
             return status, None, b""
-        length = (resp.getheader("Content-Length") or "").strip()
-        expected = int(length) if length.isdigit() and not getattr(resp, "chunked", False) else None
+        expected = _declared_length(resp)
         if expected is not None and expected > MAX_INDEX_BYTES:
             raise IndexFetchError("too_large")
         # read1: at most one read from the socket per call, so the deadline is
@@ -374,6 +373,29 @@ def _get_once(parts, timeout: float, deadline: float):
                 pass
         if conn is not None:
             conn.close()
+
+
+def _declared_length(resp) -> int | None:
+    """The body length the response declares; None when it declares none or is
+    chunked. A malformed value, or repeated headers that disagree, is refused
+    (RFC 9110 section 8.6): http.client would quietly pick one or read to EOF,
+    and the completeness check would have nothing to hold the body to."""
+    if getattr(resp, "chunked", False):
+        return None
+    headers = getattr(resp, "headers", None)
+    raw = headers.get_all("Content-Length") if headers is not None else None
+    if raw is None:
+        one = resp.getheader("Content-Length")
+        raw = [] if one is None else [one]
+    values = {part.strip() for value in raw for part in str(value).split(",")}
+    if not values:
+        return None
+    if len(values) != 1:
+        raise IndexFetchError("bad_content_length")
+    (value,) = values
+    if not (value.isascii() and value.isdigit()):
+        raise IndexFetchError("bad_content_length")
+    return int(value)
 
 
 def _abort_socket(current: dict, fired: threading.Event) -> None:
