@@ -347,6 +347,43 @@ def test_slow_dns_is_bounded_and_cannot_answer_a_later_lookup(net, monkeypatch):
     assert net.requests[-1][3] == PUBLIC_IP
 
 
+def test_stalled_lookups_cannot_pile_up_threads(net, monkeypatch):
+    monkeypatch.setattr(im, "TOTAL_TIMEOUT", 0.2)
+    monkeypatch.setattr(im, "_dns_slots", threading.BoundedSemaphore(2))
+    release, calls = threading.Event(), []
+
+    def resolve(host, port):
+        calls.append(host)
+        release.wait(5)
+        return [PUBLIC_IP]
+
+    monkeypatch.setattr(im, "_resolve", resolve)
+    net.serve("www.figureskatingresults.fi", "/r/index.htm", body=INDEX)
+    url = "https://www.figureskatingresults.fi/r/index.htm"
+
+    for _ in range(2):  # two lookups stall and are abandoned
+        with pytest.raises(im.IndexFetchError) as e:
+            fetch(url)
+        assert e.value.code == "timeout"
+    started = time.monotonic()
+    with pytest.raises(im.IndexFetchError) as e:  # no slot left: refused at once
+        fetch(url)
+    assert e.value.code == "dns_busy"
+    assert time.monotonic() - started < 0.1
+    assert len(calls) == 2  # no third lookup thread was started
+
+    release.set()  # the stalled lookups end and give their slots back
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            assert fetch(url) == INDEX.decode()
+            break
+        except im.IndexFetchError:
+            time.sleep(0.01)
+    else:
+        pytest.fail("the slots were not released")
+
+
 class TrickleResponse(FakeResponse):
     """One byte per read, each read costing a second of (fake) time."""
 

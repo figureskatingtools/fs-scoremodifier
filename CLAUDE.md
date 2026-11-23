@@ -134,11 +134,11 @@ Four pieces:
    SNI/cert on the name), redirects followed by hand ≤ 3 hops with each re-checked (https +
    allow-list + port, no downgrade), body ≤ 2 MiB and complete (a non-chunked response shorter than
    its `Content-Length` is a failure), **one 20 s budget** for the whole fetch — DNS (lookup in a
-   daemon thread, abandoned at the deadline), each TCP connect and TLS handshake (the remaining time
+   daemon thread, abandoned at the deadline; at most `MAX_DNS_LOOKUPS` = 8 in flight, a further fetch fails at once), each TCP connect and TLS handshake (the remaining time
    is re-read before each phase and each address attempt), and the transfer (a watchdog, armed before
    the first connection and handed every socket before its handshake, shuts it down at the deadline;
    plus a deadline check before every `read1`). A rejected URL is 400 with fixed wording (nothing echoed); every fetch failure is the
-   same 502. Tests: `tests/test_index_fetch.py` (fake DNS/connection, no network). `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
+   same 502. Tests: `tests/test_index_fetch.py` (fake DNS/connection, plus the real `http.client` over a socket pair; no network). `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
    and the daily auto-delete timer are mirrored from judgepapers for
    future features / storage hygiene (not wired to the current UI). The auth/storage/SAS helpers are reused verbatim from
    judgepapers. **The function imports `scoremodifier.per_skater`**; the canonical package lives at the

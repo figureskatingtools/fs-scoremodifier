@@ -376,11 +376,22 @@ def _abort_socket(current: dict, fired: threading.Event) -> None:
         pass
 
 
+# An abandoned lookup keeps its thread until getaddrinfo returns. At most this
+# many lookups may be in flight (running or abandoned): behind a stalled
+# resolver further fetches fail at once instead of piling up threads.
+MAX_DNS_LOOKUPS = 8
+_dns_slots = threading.BoundedSemaphore(MAX_DNS_LOOKUPS)
+
+
 def _resolve_within(host: str, port: int, timeout: float) -> list[str]:
     """``_resolve`` bounded by ``timeout``: getaddrinfo cannot be interrupted,
     so it runs in a daemon thread and is abandoned when it is too slow. Each
     call has its own result holder, so an abandoned lookup can never answer a
-    later one."""
+    later one, and each holds one of ``MAX_DNS_LOOKUPS`` slots until it
+    really ends."""
+    slots = _dns_slots
+    if not slots.acquire(blocking=False):
+        raise IndexFetchError("dns_busy")
     box: dict = {}
     done = threading.Event()
 
@@ -390,9 +401,14 @@ def _resolve_within(host: str, port: int, timeout: float) -> list[str]:
         except BaseException as e:  # reported to the waiting caller
             box["error"] = e
         finally:
+            slots.release()
             done.set()
 
-    threading.Thread(target=work, name="index-dns", daemon=True).start()
+    try:
+        threading.Thread(target=work, name="index-dns", daemon=True).start()
+    except RuntimeError:  # no thread to be had
+        slots.release()
+        raise IndexFetchError("dns_busy") from None
     if not done.wait(timeout):
         raise IndexFetchError("timeout")
     if "error" in box:
