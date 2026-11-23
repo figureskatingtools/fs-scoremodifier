@@ -247,6 +247,9 @@ def fetch_index_html(url: str, *, allowed_hosts: list[str] | None = None, timeou
                 # The page pointed somewhere we will not go: a fetch failure,
                 # not a bad input from the caller.
                 raise IndexFetchError(f"redirect_{e.code}") from None
+            except ValueError:
+                # urljoin refuses a malformed Location (e.g. an unclosed "[").
+                raise IndexFetchError("redirect_invalid_url") from None
             continue
         raise IndexFetchError(f"upstream_status_{status}")
     raise IndexFetchError("too_many_redirects")
@@ -326,8 +329,17 @@ def _get_once(parts, timeout: float, deadline: float):
         chunks, total = [], 0
         while True:
             left = remaining()
+            if expected is not None and total == expected:
+                # The declared length is in: nothing more to wait for. For a
+                # closing response http.client has closed the socket by now.
+                break
             if sock is not None:
-                sock.settimeout(left)
+                try:
+                    sock.settimeout(left)
+                except OSError:
+                    # Already closed by http.client (a finished closing
+                    # response): the read below returns EOF at once.
+                    pass
             chunk = read(min(_READ_CHUNK, MAX_INDEX_BYTES + 1 - total))
             if not chunk:
                 # EOF: a cut-off response is not an index page.

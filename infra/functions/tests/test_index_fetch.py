@@ -4,6 +4,8 @@ No network: DNS (`_resolve`) and the HTTPS connection (`_open_connection`) are
 replaced by fakes that serve scripted responses per (host, path).
 """
 
+import http.client
+import socket
 import threading
 import time
 
@@ -160,6 +162,7 @@ def test_redirect_within_the_allow_list_is_followed(net):
     ("https://evil.example/", "redirect_host_not_allowed"),
     ("http://www.figureskatingresults.fi/r/index.htm", "redirect_scheme_not_allowed"),  # no downgrade
     ("file:///etc/passwd", "redirect_invalid_url"),
+    ("https://[broken/index.htm", "redirect_invalid_url"),  # urljoin itself refuses it
 ])
 def test_redirect_off_the_allow_list_or_to_http_is_refused(net, location, code):
     net.serve("www.figureskatingresults.fi", "/r/index.htm", 302, headers={"Location": location})
@@ -549,3 +552,76 @@ def test_chunked_response_is_not_held_to_a_content_length(net):
     resp.chunked = True
     net.routes[("www.figureskatingresults.fi", "/chunked")] = lambda: resp
     assert fetch("https://www.figureskatingresults.fi/chunked") == INDEX.decode()
+
+
+# ---------------------------------------------------------------------------
+# Real http.client over a socket pair (still no network): the fakes above never
+# close anything, but http.client closes the socket of a finished closing
+# response, and the read loop must cope with that.
+# ---------------------------------------------------------------------------
+
+def _serve_once(monkeypatch, response_head: bytes, body: bytes, *, close: bool):
+    client, server = socket.socketpair()
+
+    def serve():
+        try:
+            received = b""
+            while b"\r\n\r\n" not in received:
+                data = server.recv(4096)
+                if not data:
+                    return
+                received += data
+            server.sendall(b"HTTP/1.1 200 OK\r\n" + response_head + b"\r\n" + body)
+        finally:
+            if close:
+                server.close()
+
+    def open_connection(host, port, ip, remaining, watch):
+        conn = http.client.HTTPConnection(host, timeout=remaining())
+        conn.sock = client
+        watch(client)
+        return conn
+
+    monkeypatch.setattr(im, "_resolve", lambda host, port: [PUBLIC_IP])
+    monkeypatch.setattr(im, "_open_connection", open_connection)
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return server, thread
+
+
+@pytest.mark.parametrize("head, close", [
+    (b"Content-Length: %d\r\nConnection: close\r\n" % len(INDEX), True),   # socket closed with the last byte
+    (b"Content-Length: %d\r\n" % len(INDEX), False),                         # keep-alive control
+    (b"Connection: close\r\n", True),                                        # no length: read to EOF
+])
+def test_real_http_client_complete_responses_are_accepted(monkeypatch, head, close):
+    server, thread = _serve_once(monkeypatch, head, INDEX, close=close)
+    try:
+        assert fetch("https://www.figureskatingresults.fi/r/index.htm") == INDEX.decode()
+    finally:
+        thread.join(timeout=5)
+        server.close()
+
+
+def test_real_http_client_chunked_response_is_accepted(monkeypatch):
+    body = b"%x\r\n" % len(INDEX) + INDEX + b"\r\n0\r\n\r\n"
+    server, thread = _serve_once(monkeypatch, b"Transfer-Encoding: chunked\r\nConnection: close\r\n", body, close=True)
+    try:
+        assert fetch("https://www.figureskatingresults.fi/r/index.htm") == INDEX.decode()
+    finally:
+        thread.join(timeout=5)
+        server.close()
+
+
+def test_real_http_client_cut_off_closing_response_is_refused(monkeypatch):
+    head = b"Content-Length: %d\r\nConnection: close\r\n" % (len(INDEX) + 50)
+    server, thread = _serve_once(monkeypatch, head, INDEX, close=True)
+    try:
+        with pytest.raises(im.IndexFetchError) as e:
+            fetch("https://www.figureskatingresults.fi/r/index.htm")
+        # http.client itself reports the short read; either way it is a fetch
+        # failure, never a truncated page.
+        assert e.value.code in ("incomplete_body", "unreachable_IncompleteRead")
+    finally:
+        thread.join(timeout=5)
+        server.close()
