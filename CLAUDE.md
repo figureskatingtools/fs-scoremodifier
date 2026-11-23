@@ -138,7 +138,7 @@ Four pieces:
    is re-read before each phase and each address attempt), and the transfer (a watchdog, armed before
    the first connection and handed every socket before its handshake, shuts it down at the deadline;
    plus a deadline check before every `read1`). A rejected URL is 400 with fixed wording (nothing echoed); every fetch failure is the
-   same 502. Tests: `tests/test_index_fetch.py` (fake DNS/connection, plus the real `http.client` over a socket pair; no network). `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
+   same 502. Tests: `tests/test_index_fetch.py` (fake DNS/connection, plus the real `http.client` over a socket pair and the real `_open_connection` against a loopback TLS server with a throwaway `openssl` certificate — name check, stalled handshake/headers/body; no network). `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
    and the daily auto-delete timer are mirrored from judgepapers for
    future features / storage hygiene (not wired to the current UI). The auth/storage/SAS helpers are reused verbatim from
    judgepapers. **The function imports `scoremodifier.per_skater`**; the canonical package lives at the

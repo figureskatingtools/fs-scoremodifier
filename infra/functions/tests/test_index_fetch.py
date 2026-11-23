@@ -5,7 +5,10 @@ replaced by fakes that serve scripted responses per (host, path).
 """
 
 import http.client
+import shutil
 import socket
+import ssl
+import subprocess
 import threading
 import time
 
@@ -190,6 +193,21 @@ def test_redirect_loop_is_cut_off(net):
     "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1",
     "0.0.0.0", "224.0.0.1", "240.0.0.1", "255.255.255.255",
     "::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+    "192.0.2.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", "192.0.0.8",
+    # IPv6 forms that carry or stand in for an internal IPv4 address
+    "::ffff:169.254.169.254",          # IPv4-mapped metadata address
+    "64:ff9b::a9fe:a9fe",              # NAT64 -> 169.254.169.254
+    "64:ff9b::7f00:1",                 # NAT64 -> 127.0.0.1
+    "64:ff9b:1::a9fe:a9fe",            # local-use NAT64
+    "2002:a9fe:a9fe::1",               # 6to4 -> 169.254.169.254
+    "2002:a00:1::1",                   # 6to4 -> 10.0.0.1
+    "2001:0:4136:e378:8000:63bf:3fff:fdd2",  # Teredo
+    "::10.0.0.1",                      # IPv4-compatible
+    "::ffff:0:10.0.0.1",               # SIIT
+    "fec0::1",                         # site-local
+    "fe80::1%eth0",                    # link-local with a zone
+    "2001:db8::1", "3fff::1", "100::1", "5f00::1",
+    "not-an-address", "",
 ])
 def test_non_public_addresses_are_refused(net, ip):
     net.dns["www.figureskatingresults.fi"] = [ip]
@@ -216,7 +234,7 @@ def test_redirect_target_is_resolved_and_checked_too(net):
     assert len(net.connections) == 1
 
 
-@pytest.mark.parametrize("ip", [PUBLIC_IP, "2a00:1450:4010:c0e::64"])
+@pytest.mark.parametrize("ip", [PUBLIC_IP, "2a00:1450:4010:c0e::64", "2001:4860:4860::8888", "::ffff:93.184.215.14"])
 def test_public_addresses_pass(ip):
     assert im._is_public_address(ip)
 
@@ -729,3 +747,172 @@ def test_real_http_client_cut_off_closing_response_is_refused(monkeypatch):
     finally:
         thread.join(timeout=5)
         server.close()
+
+
+# ---------------------------------------------------------------------------
+# Real TLS over loopback (still no network): the real _open_connection, a real
+# ssl handshake against a throwaway certificate, and a server that misbehaves.
+# What the fakes cannot show: the certificate is checked against the host name
+# although the connection goes to an address, and a stalled handshake or body
+# is really cut off at the deadline.
+# ---------------------------------------------------------------------------
+
+HOST = "www.figureskatingresults.fi"
+
+
+@pytest.fixture(scope="module")
+def tls_cert(tmp_path_factory):
+    openssl = shutil.which("openssl")
+    if not openssl:
+        pytest.skip("openssl is needed to make a throwaway certificate")
+    folder = tmp_path_factory.mktemp("tls")
+    cert, key = folder / "cert.pem", folder / "key.pem"
+    subprocess.run(
+        [openssl, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+         "-keyout", str(key), "-out", str(cert), "-days", "2", "-subj", f"/CN={HOST}",
+         "-addext", f"subjectAltName=DNS:{HOST}"],
+        check=True, capture_output=True)
+    return str(cert), str(key)
+
+
+class _TlsServer:
+    """One loopback TLS connection, scripted by ``behave(conn, stop)``."""
+
+    def __init__(self, cert, key, behave, handshake=True):
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
+        self.stop = threading.Event()
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+
+        def run():
+            try:
+                raw, _ = self.listener.accept()
+            except OSError:
+                return
+            with raw:
+                if not handshake:
+                    self.stop.wait(10)  # never answers the ClientHello
+                    return
+                try:
+                    with ctx.wrap_socket(raw, server_side=True) as conn:
+                        behave(conn, self.stop)
+                except (OSError, ssl.SSLError):
+                    pass
+
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        self.listener.close()
+        self.thread.join(timeout=5)
+
+
+def _read_request(conn):
+    received = b""
+    while b"\r\n\r\n" not in received:
+        data = conn.recv(4096)
+        if not data:
+            break
+        received += data
+    return received
+
+
+@pytest.fixture
+def real_tls(monkeypatch, tls_cert):
+    """start(behave, ...) -> the list of addresses the client connected to."""
+    cert, key = tls_cert
+    servers = []
+
+    def start(behave, *, handshake=True, trust=True):
+        server = _TlsServer(cert, key, behave, handshake=handshake)
+        servers.append(server)
+        connected = []
+
+        def tcp_connect(address, timeout):
+            connected.append(address)  # the checked address; the loopback server stands in for it
+            return socket.create_connection(("127.0.0.1", server.port), timeout=timeout)
+
+        monkeypatch.setattr(im, "_resolve", lambda host, port: [PUBLIC_IP])
+        monkeypatch.setattr(im, "_tcp_connect", tcp_connect)
+        if trust:
+            monkeypatch.setattr(im, "_tls_context", lambda: ssl.create_default_context(cafile=cert))
+        return connected
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+def _serve_index(conn, stop):
+    request = _read_request(conn)
+    assert request.startswith(b"GET /r/index.htm HTTP/1.1\r\n") and b"Host: " + HOST.encode() in request
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(INDEX) + INDEX)
+
+
+def test_real_tls_fetch_connects_to_the_checked_address_and_verifies_the_name(real_tls):
+    connected = real_tls(_serve_index)
+    assert fetch(f"https://{HOST}/r/index.htm") == INDEX.decode()
+    assert connected == [(PUBLIC_IP, 443)]
+
+
+def test_real_tls_certificate_for_another_name_is_refused(real_tls):
+    real_tls(_serve_index)  # the certificate names www.…, the request goes to the apex
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch("https://figureskatingresults.fi/r/index.htm")
+    assert e.value.code == "unreachable_SSLCertVerificationError"
+
+
+def test_real_tls_untrusted_certificate_is_refused(real_tls):
+    real_tls(_serve_index, trust=False)  # the default context does not know the throwaway certificate
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch(f"https://{HOST}/r/index.htm")
+    assert e.value.code == "unreachable_SSLCertVerificationError"
+
+
+def _within_budget(monkeypatch, url):
+    """The fetch must end in ``timeout`` close to a 0.5 s budget."""
+    monkeypatch.setattr(im, "TOTAL_TIMEOUT", 0.5)
+    started = time.monotonic()
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch(url)
+    elapsed = time.monotonic() - started
+    assert e.value.code == "timeout"
+    assert 0.4 < elapsed < 3
+
+
+def test_real_tls_stalled_handshake_is_cut_off_at_the_deadline(real_tls, monkeypatch):
+    real_tls(_serve_index, handshake=False)
+    _within_budget(monkeypatch, f"https://{HOST}/r/index.htm")
+
+
+def test_real_tls_stalled_body_is_cut_off_at_the_deadline(real_tls, monkeypatch):
+    def behave(conn, stop):
+        _read_request(conn)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + b"x" * 10)
+        stop.wait(10)
+
+    real_tls(behave)
+    _within_budget(monkeypatch, f"https://{HOST}/r/index.htm")
+
+
+def test_real_tls_stalled_headers_are_cut_off_at_the_deadline(real_tls, monkeypatch):
+    def behave(conn, stop):
+        _read_request(conn)
+        conn.sendall(b"HTTP/1.1 200 OK\r\n")
+        stop.wait(10)
+
+    real_tls(behave)
+    _within_budget(monkeypatch, f"https://{HOST}/r/index.htm")
+
+
+def test_real_tls_trickled_body_is_cut_off_at_the_deadline(real_tls, monkeypatch):
+    def behave(conn, stop):
+        _read_request(conn)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+        while not stop.wait(0.05):  # every read succeeds; only the budget ends it
+            conn.sendall(b"x")
+
+    real_tls(behave)
+    _within_budget(monkeypatch, f"https://{HOST}/r/index.htm")
