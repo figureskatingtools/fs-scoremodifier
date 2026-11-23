@@ -116,7 +116,8 @@ def _output_blob(folder: str, filename: str) -> str:
     return blob
 
 # Hosts the parse_index endpoint may fetch (SSRF guard). Override via env
-# INDEX_ALLOWED_HOSTS (comma-separated); defaults to the public results service.
+# INDEX_ALLOWED_HOSTS (comma-separated host names; only port 443 is ever
+# fetched); defaults to the public results service.
 INDEX_ALLOWED_HOSTS = [
     h.strip()
     for h in os.environ.get(

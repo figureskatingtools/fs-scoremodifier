@@ -17,6 +17,8 @@ INDEX = b"<html><title>Cup</title></html>"
 
 
 class FakeResponse:
+    chunked = False
+
     def __init__(self, status, body=b"", headers=None):
         self.status = status
         self._body = body
@@ -80,9 +82,10 @@ class FakeNet:
             raise OSError("no such host")
         return self.dns[host]
 
-    def open(self, host, port, ip, timeout):
-        assert timeout > 0
+    def open(self, host, port, ip, remaining, watch):
+        assert remaining() > 0
         conn = FakeConnection(self, host, port, ip)
+        watch(conn.fake_sock)
         self.connections.append(conn)
         return conn
 
@@ -127,6 +130,7 @@ def test_http_link_is_upgraded_and_never_sent_in_clear(net):
     "https://www.figureskatingresults.fi.evil.example/",
     "https://user:pw@www.figureskatingresults.fi/r/index.htm",
     "https://www.figureskatingresults.fi:8443/r/index.htm",
+    "https://www.figureskatingresults.fi:80/r/index.htm",
     "https:///nohost",
     "https://[::1/",
     "",
@@ -239,7 +243,7 @@ def test_upstream_error_status_is_a_fetch_error(net):
 
 
 def test_connection_failures_are_wrapped(net, monkeypatch):
-    def boom(host, port, ip, timeout):
+    def boom(host, port, ip, remaining, watch):
         raise ConnectionRefusedError("nope")
 
     monkeypatch.setattr(im, "_open_connection", boom)
@@ -285,11 +289,11 @@ def test_next_checked_address_is_tried_without_resolving_again(net, monkeypatch)
     lookups, attempts = [], []
     monkeypatch.setattr(im, "_resolve", lambda host, port: lookups.append(host) or net.dns[host])
 
-    def open_(host, port, ip, timeout):
+    def open_(host, port, ip, remaining, watch):
         attempts.append(ip)
         if ip == v6:
             raise OSError("network unreachable")
-        return net.open(host, port, ip, timeout)
+        return net.open(host, port, ip, remaining, watch)
 
     monkeypatch.setattr(im, "_open_connection", open_)
     net.serve("www.figureskatingresults.fi", "/r/index.htm", body=INDEX)
@@ -303,7 +307,7 @@ def test_all_addresses_unreachable_is_a_fetch_error(net, monkeypatch):
     net.dns["www.figureskatingresults.fi"] = [PUBLIC_IP, "2a00:1450:4010:c0e::64"]
     attempts = []
 
-    def refuse(host, port, ip, timeout):
+    def refuse(host, port, ip, remaining, watch):
         attempts.append(ip)
         raise ConnectionRefusedError()
 
@@ -391,3 +395,157 @@ def test_a_stalled_read_is_cut_off_at_the_deadline(net, monkeypatch):
     assert e.value.code == "timeout"
     assert time.monotonic() - started < 2
     assert net.connections[0].fake_sock.shut.is_set()
+
+
+# ── second review pass: port, one budget, Content-Length ─────────────────────
+
+def test_only_port_443_whatever_the_allow_list_says(net):
+    # CLI mode (no allow-list): still 443 only.
+    with pytest.raises(im.IndexUrlRejected) as e:
+        im.fetch_index_html("https://example.com:8443/index.htm", allowed_hosts=None)
+    assert e.value.code == "port_not_allowed"
+    # A host:port entry does not open that port.
+    with pytest.raises(im.IndexUrlRejected) as e:
+        im.fetch_index_html("https://www.figureskatingresults.fi:8443/r/index.htm",
+                            allowed_hosts=["www.figureskatingresults.fi:8443"])
+    assert e.value.code == "port_not_allowed"
+    assert im._allowed_set(["www.figureskatingresults.fi:8443"]) == {"www.figureskatingresults.fi:8443"}
+    assert net.requests == []
+
+
+def test_explicit_443_and_host_443_entries_work(net):
+    net.serve("www.figureskatingresults.fi", "/r/index.htm", body=INDEX)
+    assert fetch("https://www.figureskatingresults.fi:443/r/index.htm") == INDEX.decode()
+    assert im.fetch_index_html("https://www.figureskatingresults.fi/r/index.htm",
+                               allowed_hosts=[" WWW.FigureSkatingResults.fi:443 "]) == INDEX.decode()
+    assert all(port == 443 for _, _, port, *_ in net.requests)
+
+
+def test_redirect_to_another_port_is_refused(net):
+    net.serve("www.figureskatingresults.fi", "/r/index.htm", 302,
+              headers={"Location": "https://www.figureskatingresults.fi:8443/r/index.htm"})
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch("https://www.figureskatingresults.fi/r/index.htm")
+    assert e.value.code == "redirect_port_not_allowed"
+    assert len(net.requests) == 1
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class _SlowTLS:
+    """A TLS socket whose handshake needs `need` seconds; it gives up when
+    its timeout is shorter (the timeout's worth of time has passed)."""
+
+    def __init__(self, clock, need, log):
+        self.clock, self.need, self.log = clock, need, log
+        self.timeout = None
+        self.closed = False
+
+    def settimeout(self, value):
+        self.timeout = value
+
+    def do_handshake(self):
+        self.log.append(("tls", self.timeout))
+        self.clock.now += min(self.need, self.timeout)
+        if self.need > self.timeout:
+            raise TimeoutError("handshake timed out")
+
+    def shutdown(self, how):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _SlowContext:
+    def __init__(self, clock, need, log):
+        self.clock, self.need, self.log = clock, need, log
+        self.wrapped = []
+
+    def wrap_socket(self, sock, server_hostname, do_handshake_on_connect=True):
+        assert do_handshake_on_connect is False
+        tls = _SlowTLS(self.clock, self.need, self.log)
+        self.wrapped.append((server_hostname, tls))
+        return tls
+
+
+@pytest.fixture
+def slow_path(monkeypatch):
+    """The real _open_connection with a fake clock, DNS, TCP and TLS layer:
+    DNS 8 s, TCP connect 9 s, TLS handshake 9 s if allowed — 26 s in all."""
+    clock, log = _Clock(), []
+    monkeypatch.setattr(im, "_monotonic", clock)
+
+    def resolve(host, port):
+        clock.now += 8
+        log.append(("dns", None))
+        return [PUBLIC_IP, "2a00:1450:4010:c0e::64"]
+
+    def tcp_connect(address, timeout):
+        log.append(("tcp", timeout))
+        clock.now += min(9, timeout)
+        if 9 > timeout:
+            raise TimeoutError("connect timed out")
+        return object()
+
+    ctx = _SlowContext(clock, 9, log)
+    monkeypatch.setattr(im, "_resolve", resolve)
+    monkeypatch.setattr(im, "_tcp_connect", tcp_connect)
+    monkeypatch.setattr(im, "_tls_context", lambda: ctx)
+    return clock, log, ctx
+
+
+def test_dns_connect_and_handshake_share_one_budget(slow_path):
+    clock, log, ctx = slow_path
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch("https://www.figureskatingresults.fi/r/index.htm")
+    assert e.value.code == "timeout"
+    assert clock.now <= im.TOTAL_TIMEOUT
+    # TCP got the per-operation cap (12 s left), the handshake only what the
+    # first two phases left over — never a fresh timeout per phase — and the
+    # second address was not tried once the budget was spent.
+    assert log == [("dns", None), ("tcp", 10.0), ("tls", 3.0)]
+    (hostname, tls), = ctx.wrapped
+    assert hostname == "www.figureskatingresults.fi" and tls.closed
+
+
+def test_open_connection_hands_the_socket_to_the_watchdog_before_the_handshake(slow_path):
+    clock, log, ctx = slow_path
+    ctx.need = 1
+    watched = []
+    conn = im._open_connection("www.figureskatingresults.fi", 443, PUBLIC_IP,
+                               lambda: 10.0, lambda s: watched.append((s, list(log))))
+    tls = ctx.wrapped[0][1]
+    assert conn.sock is tls and conn.host == "www.figureskatingresults.fi"
+    assert watched == [(tls, [("tcp", 10.0)])]  # before the handshake ran
+    assert log[-1] == ("tls", 10.0)
+
+
+def test_response_shorter_than_its_content_length_is_refused(net):
+    net.serve("www.figureskatingresults.fi", "/cut", body=b"A" * 50, headers={"Content-Length": "100"})
+    with pytest.raises(im.IndexFetchError) as e:
+        fetch("https://www.figureskatingresults.fi/cut")
+    assert e.value.code == "incomplete_body"
+
+
+def test_response_matching_its_content_length_is_accepted(net):
+    net.serve("www.figureskatingresults.fi", "/ok", body=INDEX, headers={"Content-Length": str(len(INDEX))})
+    assert fetch("https://www.figureskatingresults.fi/ok") == INDEX.decode()
+
+
+def test_response_without_content_length_is_accepted(net):
+    net.serve("www.figureskatingresults.fi", "/nolen", body=INDEX)
+    assert fetch("https://www.figureskatingresults.fi/nolen") == INDEX.decode()
+
+
+def test_chunked_response_is_not_held_to_a_content_length(net):
+    resp = FakeResponse(200, INDEX, {"Content-Length": "100", "Transfer-Encoding": "chunked"})
+    resp.chunked = True
+    net.routes[("www.figureskatingresults.fi", "/chunked")] = lambda: resp
+    assert fetch("https://www.figureskatingresults.fi/chunked") == INDEX.decode()

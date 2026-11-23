@@ -141,29 +141,53 @@ def _resolve(host: str, port: int) -> list[str]:
     return [info[4][0] for info in infos]
 
 
-def _open_connection(host: str, port: int, ip: str, timeout: float):
+# Test seams for the real connection path.
+_tcp_connect = socket.create_connection
+_tls_context = ssl.create_default_context
+
+
+def _open_connection(host: str, port: int, ip: str, remaining, watch):
     """An HTTPS connection to the already-validated ``ip``, with SNI and
     certificate checks against ``host`` (test seam). Connecting to the checked
-    address, not the name, means a second DNS answer cannot swap it."""
-    ctx = ssl.create_default_context()
-    sock = socket.create_connection((ip, port), timeout=timeout)
+    address, not the name, means a second DNS answer cannot swap it.
+
+    ``remaining()`` is the fetch's shared budget (raises once it is spent): it
+    is read again before the TCP connect and before the TLS handshake, so no
+    phase gets a fresh timeout. ``watch(sock)`` hands the socket to the
+    deadline watchdog before the handshake starts."""
+    ctx = _tls_context()
+    sock = _tcp_connect((ip, port), timeout=remaining())
+    tls = None
     try:
-        tls = ctx.wrap_socket(sock, server_hostname=host)
+        tls = ctx.wrap_socket(sock, server_hostname=host, do_handshake_on_connect=False)
+        watch(tls)
+        tls.settimeout(remaining())
+        tls.do_handshake()
     except BaseException:
-        sock.close()
+        (tls if tls is not None else sock).close()
         raise
-    conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+    conn = http.client.HTTPSConnection(host, port, timeout=remaining(), context=ctx)
     conn.sock = tls
     return conn
 
 
 def _host_allowed(parts, allowed: set[str] | None) -> bool:
-    if allowed is None:
-        return True
-    host = (parts.hostname or "").lower()
-    if parts.port in (None, 443):
-        return host in allowed
-    return f"{host}:{parts.port}" in allowed
+    return allowed is None or (parts.hostname or "").lower() in allowed
+
+
+def _allowed_set(allowed_hosts) -> set[str] | None:
+    """Allow-list entries are host names (port 443 is the only port fetched);
+    a ``host:443`` entry means the host, any other ``host:port`` never matches."""
+    if allowed_hosts is None:
+        return None
+    out = set()
+    for entry in allowed_hosts:
+        entry = entry.strip().lower()
+        if entry.endswith(":443"):
+            entry = entry[:-4]
+        if entry:
+            out.add(entry)
+    return out
 
 
 def _check_url(url, allowed: set[str] | None, *, upgrade_http: bool):
@@ -185,6 +209,10 @@ def _check_url(url, allowed: set[str] | None, *, upgrade_http: bool):
         parts = parts._replace(scheme="https", netloc=netloc)
     elif scheme != "https":
         raise IndexUrlRejected("scheme_not_allowed")
+    # Port 443 only — whatever the allow-list says, in CLI mode too, and on
+    # every redirect hop.
+    if parts.port not in (None, 443):
+        raise IndexUrlRejected("port_not_allowed")
     if not _host_allowed(parts, allowed):
         raise IndexUrlRejected("host_not_allowed")
     return parts
@@ -196,7 +224,7 @@ def fetch_index_html(url: str, *, allowed_hosts: list[str] | None = None, timeou
     ``allowed_hosts`` (when given) restricts the host — the Azure Function
     passes the public results host; the CLI passes ``None`` (any host). Always:
     https only (an ``http://`` link is upgraded before anything is sent), no
-    credentials in the URL, every resolved address must be public (no private,
+    credentials in the URL, port 443 only, every resolved address must be public (no private,
     loopback, link-local, multicast or reserved IPv4/IPv6), redirects are
     followed by hand at most ``MAX_REDIRECTS`` times with each hop re-checked
     the same way (https and the allow-list, no upgrade), the body is capped at
@@ -205,7 +233,7 @@ def fetch_index_html(url: str, *, allowed_hosts: list[str] | None = None, timeou
     Raises ``IndexUrlRejected`` (a ``ValueError``) for an unacceptable URL and
     ``IndexFetchError`` for anything that went wrong while fetching.
     """
-    allowed = None if allowed_hosts is None else {h.strip().lower() for h in allowed_hosts if h.strip()}
+    allowed = _allowed_set(allowed_hosts)
     deadline = _monotonic() + TOTAL_TIMEOUT
     parts = _check_url(url, allowed, upgrade_http=True)
     for _hop in range(MAX_REDIRECTS + 1):
@@ -245,32 +273,42 @@ def _get_once(parts, timeout: float, deadline: float):
     if parts.query:
         target += "?" + quote(parts.query, safe=_URL_SAFE + "?")
 
-    conn = sock = watchdog = None
+    conn = sock = None
     fired = threading.Event()
+    # Hard stop at the deadline whatever the server does (slow handshake,
+    # headers or body): shutting the current socket down unblocks any pending
+    # read. Each connection attempt hands its socket over before the handshake.
+    current: dict = {}
+
+    def watch(s) -> None:
+        current["sock"] = s
+
+    watchdog = threading.Timer(max(deadline - _monotonic(), 0.0), _abort_socket, (current, fired))
+    watchdog.daemon = True
+    watchdog.start()
     try:
         # Every address was checked above; try them in order (e.g. an
         # unreachable IPv6 answer before a working IPv4 one), never resolving
-        # the name again.
+        # the name again, all within the same budget.
         last_error = None
         for ip in addresses:
             try:
-                conn = _open_connection(host, port, ip, remaining())
+                conn = _open_connection(host, port, ip, remaining, watch)
                 break
             except IndexFetchError:
                 raise
             except Exception as e:  # refused, unreachable, TLS failure
+                if fired.is_set() or _monotonic() >= deadline:
+                    raise IndexFetchError("timeout") from None
                 last_error = e
         if conn is None:
             raise IndexFetchError(f"unreachable_{type(last_error).__name__}")
         # Kept here: http.client drops conn.sock for a closing response, but
         # the response still reads from this socket.
         sock = getattr(conn, "sock", None)
-        # Hard stop at the deadline whatever the server does (slow headers,
-        # trickled body): shutting the socket down unblocks any pending read.
         if sock is not None:
-            watchdog = threading.Timer(max(deadline - _monotonic(), 0.0), _abort_socket, (sock, fired))
-            watchdog.daemon = True
-            watchdog.start()
+            current["sock"] = sock
+        remaining()
         conn.request("GET", target, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"})
         resp = conn.getresponse()
         status = resp.status
@@ -279,7 +317,8 @@ def _get_once(parts, timeout: float, deadline: float):
         if status != 200:
             return status, None, b""
         length = (resp.getheader("Content-Length") or "").strip()
-        if length.isdigit() and int(length) > MAX_INDEX_BYTES:
+        expected = int(length) if length.isdigit() and not getattr(resp, "chunked", False) else None
+        if expected is not None and expected > MAX_INDEX_BYTES:
             raise IndexFetchError("too_large")
         # read1: at most one read from the socket per call, so the deadline is
         # checked between reads even when the server trickles bytes.
@@ -291,6 +330,9 @@ def _get_once(parts, timeout: float, deadline: float):
                 sock.settimeout(left)
             chunk = read(min(_READ_CHUNK, MAX_INDEX_BYTES + 1 - total))
             if not chunk:
+                # EOF: a cut-off response is not an index page.
+                if expected is not None and total != expected:
+                    raise IndexFetchError("incomplete_body")
                 break
             chunks.append(chunk)
             total += len(chunk)
@@ -311,8 +353,11 @@ def _get_once(parts, timeout: float, deadline: float):
             conn.close()
 
 
-def _abort_socket(sock, fired: threading.Event) -> None:
+def _abort_socket(current: dict, fired: threading.Event) -> None:
     fired.set()
+    sock = current.get("sock")
+    if sock is None:
+        return
     try:
         sock.shutdown(socket.SHUT_RDWR)
     except Exception:

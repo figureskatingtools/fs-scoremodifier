@@ -86,10 +86,12 @@ record `id` that is not 1–64 letters, digits, `-` or `_` is an unknown record
 
 `parse_index` answers 400 with a fixed message (the URL is never echoed) for a
 link that is not `https` (an `http://` link on port 80 is upgraded), carries
-credentials or a non-default port, or is not on `INDEX_ALLOWED_HOSTS`; and one
-502 `Could not fetch the index page.` for every failure while fetching
-(unreachable, a redirect off the allow-list or to `http`, a non-public
-address, more than 3 redirects, a body over 2 MiB, 20 s total). The same
+credentials or any port but 443, or is not on `INDEX_ALLOWED_HOSTS` (host
+names; a `host:443` entry is the host, other `host:port` entries never match);
+and one 502 `Could not fetch the index page.` for every failure while fetching
+(unreachable, a redirect off the allow-list, to `http` or to another port, a
+non-public address, more than 3 redirects, a body over 2 MiB or shorter than
+its `Content-Length`, 20 s in total including DNS, connect and handshake). The same
 fetch fills `generate_results`' blank fields from `indexUrl`; there a failure
 only skips the auto-fill. `generate_results` reduces `catFile`/`pdfFile` to a
 plain file name inside the record's own folder (see `CLAUDE.md`).
