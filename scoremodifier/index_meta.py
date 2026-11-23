@@ -276,7 +276,7 @@ def _get_once(parts, timeout: float, deadline: float):
     if parts.query:
         target += "?" + quote(parts.query, safe=_URL_SAFE + "?")
 
-    conn = sock = None
+    conn = sock = resp = None
     fired = threading.Event()
     # Hard stop at the deadline whatever the server does (slow handshake,
     # headers or body): shutting the current socket down unblocks any pending
@@ -361,6 +361,14 @@ def _get_once(parts, timeout: float, deadline: float):
     finally:
         if watchdog is not None:
             watchdog.cancel()
+        # A closing response owns the socket (http.client hands it over), and
+        # conn.close() does not reach it: close it here, read to the end or
+        # not (a redirect, an error status, an oversize or cut-off body).
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
         if conn is not None:
             conn.close()
 

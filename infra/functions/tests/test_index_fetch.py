@@ -36,6 +36,10 @@ class FakeResponse:
         return chunk
 
     read1 = read
+    closed = False
+
+    def close(self):
+        self.closed = True
 
 
 class FakeSock:
@@ -638,6 +642,50 @@ def test_real_http_client_complete_responses_are_accepted(monkeypatch, head, clo
     finally:
         thread.join(timeout=5)
         server.close()
+
+
+@pytest.mark.parametrize("status_line, head, body, code", [
+    (b"302 Found", b"Location: https://evil.example/\r\nContent-Length: 5\r\nConnection: close\r\n", b"moved", "redirect_host_not_allowed"),
+    (b"404 Not Found", b"Content-Length: 9\r\nConnection: close\r\n", b"not found", "upstream_status_404"),
+    (b"200 OK", b"Content-Length: %d\r\nConnection: close\r\n" % (im.MAX_INDEX_BYTES + 1), b"x" * 64, "too_large"),
+    (b"200 OK", b"Connection: close\r\n", b"x" * 64, None),   # read to the end
+])
+def test_real_http_client_socket_is_closed_whatever_the_outcome(monkeypatch, status_line, head, body, code):
+    """A closing response owns the socket; an unread one must not leave it open."""
+    client, server = socket.socketpair()
+
+    def serve():
+        received = b""
+        while b"\r\n\r\n" not in received:
+            data = server.recv(4096)
+            if not data:
+                return
+            received += data
+        server.sendall(b"HTTP/1.1 " + status_line + b"\r\n" + head + b"\r\n" + body)
+        server.shutdown(socket.SHUT_WR)
+
+    def open_connection(host, port, ip, remaining, watch):
+        conn = http.client.HTTPConnection(host, timeout=remaining())
+        conn.sock = client
+        watch(client)
+        return conn
+
+    monkeypatch.setattr(im, "_resolve", lambda host, port: [PUBLIC_IP])
+    monkeypatch.setattr(im, "_open_connection", open_connection)
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        if code is None:
+            assert fetch("https://www.figureskatingresults.fi/r/index.htm") == body.decode()
+        else:
+            with pytest.raises(im.IndexFetchError) as e:
+                fetch("https://www.figureskatingresults.fi/r/index.htm")
+            assert e.value.code == code
+        assert client.fileno() == -1   # really closed, not left to the garbage collector
+    finally:
+        thread.join(timeout=5)
+        server.close()
+        client.close()
 
 
 def test_real_http_client_chunked_response_is_accepted(monkeypatch):
