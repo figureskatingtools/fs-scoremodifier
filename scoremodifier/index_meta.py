@@ -163,10 +163,12 @@ def _open_connection(host: str, port: int, ip: str, remaining, watch):
         watch(tls)
         tls.settimeout(remaining())
         tls.do_handshake()
+        # Still inside the try: the budget can run out exactly here, and the
+        # socket must not outlive that.
+        conn = http.client.HTTPSConnection(host, port, timeout=remaining(), context=ctx)
     except BaseException:
         (tls if tls is not None else sock).close()
         raise
-    conn = http.client.HTTPSConnection(host, port, timeout=remaining(), context=ctx)
     conn.sock = tls
     return conn
 

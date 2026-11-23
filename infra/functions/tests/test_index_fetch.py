@@ -571,6 +571,25 @@ def test_open_connection_hands_the_socket_to_the_watchdog_before_the_handshake(s
     assert log[-1] == ("tls", 10.0)
 
 
+def test_open_connection_closes_the_socket_when_the_budget_ends_with_the_handshake(monkeypatch):
+    clock, log = _Clock(), []
+    ctx = _SlowContext(clock, 5, log)   # the handshake uses exactly what is left
+    monkeypatch.setattr(im, "_tcp_connect", lambda address, timeout: object())
+    monkeypatch.setattr(im, "_tls_context", lambda: ctx)
+
+    def remaining():
+        left = 5.0 - clock()
+        if left <= 0:
+            raise im.IndexFetchError("timeout")
+        return left
+
+    with pytest.raises(im.IndexFetchError) as e:
+        im._open_connection("www.figureskatingresults.fi", 443, PUBLIC_IP, remaining, lambda s: None)
+    assert e.value.code == "timeout"
+    (_, tls), = ctx.wrapped
+    assert tls.closed
+
+
 def test_response_shorter_than_its_content_length_is_refused(net):
     net.serve("www.figureskatingresults.fi", "/cut", body=b"A" * 50, headers={"Content-Length": "100"})
     with pytest.raises(im.IndexFetchError) as e:
