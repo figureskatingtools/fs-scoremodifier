@@ -85,6 +85,31 @@ def test_a_link_never_points_outside_the_records_folder(seeded):
     assert "Other" not in json.dumps(body)
 
 
+def test_a_dot_dot_blob_name_never_leaves_the_records_folder(seeded):
+    # Inside the prefix as a string, but Blob Storage resolves ".." segments.
+    seeded.papers[(COMP_ID, "x.htm")] = {
+        "PartitionKey": COMP_ID, "RowKey": "x.htm", "FileName": "x.htm",
+        "BlobName": f"{FOLDER}/output/../../Other-bbbbbbbb/output/x.htm"}
+    seeded.papers[(COMP_ID, "y")] = {
+        "PartitionKey": COMP_ID, "RowKey": "y", "FileName": "../../Other-bbbbbbbb/output/y.htm"}
+    seeded.papers[(COMP_ID, "z")] = {
+        "PartitionKey": COMP_ID, "RowKey": "z", "FileName": ".."}
+    _, body = _details()
+    files = _by_file(body)
+    # BlobName refused, the FileName fallback inside the folder used instead.
+    assert urlparse(files["x.htm"]["url"]).path == f"/{fa.CONTAINER_NAME}/Spring%20Cup-{COMP_ID}/output/x.htm"
+    for name in ("../../Other-bbbbbbbb/output/y.htm", ".."):
+        assert files[name]["url"] is None
+    assert "Other" not in json.dumps([f["url"] for f in body["generatedFiles"]])
+
+
+@pytest.mark.parametrize("bad_id", ["../x", "a/b", "x'y", "a" * 65, " aaaaaaaa"])
+def test_a_malformed_record_id_is_an_unknown_record(seeded, bad_id):
+    resp = call(fa.get_competition_details, make_request("get_competition_details", method="GET", params={"id": bad_id}))
+    assert resp.status_code == 404
+    assert json.loads(resp.get_body()) == {"error": "platform_not_found"}
+
+
 def test_no_link_is_signed_before_the_access_check(seeded, access, monkeypatch):
     signed = []
     monkeypatch.setattr(fa, "generate_blob_read_sas_url", lambda *a, **kw: signed.append(a) or "u")

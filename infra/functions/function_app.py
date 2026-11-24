@@ -22,7 +22,11 @@ from scoremodifier.extract import extract_results
 from scoremodifier.model import ResultsMeta
 from scoremodifier.results import render_results_pdf
 from scoremodifier.results_html import render_results_html
-from scoremodifier.index_meta import fetch_index_html, parse_index_html, match_category
+from scoremodifier.index_meta import IndexUrlRejected, fetch_index_html, parse_index_html, match_category
+
+# The Azure SDK logs every storage request URL (blob paths = record and file
+# names) at INFO; host.json levels do not reach Python loggers, so cap it here.
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
 
 import platform_access
 from platform_clock import (
@@ -60,20 +64,60 @@ DEFAULT_SUPERTITLE = "MUODOSTELMALUISTELU · VAPAAOHJELMA"
 TULOKKAAT_PDF_FILENAME = "FSKXSYNCHRONMLTULO--01FNL-000100--_JudgesDetailsperSkater.pdf"
 
 
-def _safe_pdf_filename(name: str, fallback: str) -> str:
-    """Sanitize an operator-supplied PDF filename: strip any path, keep simple
-    characters, and guarantee a .pdf extension. Falls back when nothing usable
-    remains."""
-    name = (name or "").replace("\\", "/").split("/")[-1].strip()
-    name = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", ".")).strip()
-    if not name:
+RESULTS_HTML_FILENAME = "results.htm"
+# Longest operator-supplied output file name kept (extension included).
+MAX_OUTPUT_FILENAME = 120
+
+
+def _safe_output_filename(name, fallback: str, extensions: tuple[str, ...]) -> str:
+    """Sanitize an operator-supplied output file name: keep only the last path
+    segment and simple characters (letters, digits, space, ``-``, ``_``,
+    ``.``), cap the length and guarantee one of ``extensions`` (the first is
+    appended when none matches). Falls back when nothing usable remains — a
+    non-string, an empty name, or one that is only dots/spaces."""
+    if not isinstance(name, str):
         return fallback
-    if not name.lower().endswith(".pdf"):
-        name += ".pdf"
-    return name
+    name = name.replace("\\", "/").split("/")[-1].strip()
+    name = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", ".")).strip()
+    if not name.strip(". "):
+        return fallback
+    ext = next((name[-len(e):] for e in extensions if name.lower().endswith(e)), None)
+    if ext is None:
+        ext = extensions[0]
+    else:
+        name = name[:-len(ext)]
+    name = name[:MAX_OUTPUT_FILENAME - len(ext)]
+    if not name.strip(". "):
+        return fallback
+    return name + ext
+
+
+def _safe_pdf_filename(name, fallback: str) -> str:
+    """The results PDF's download name (``pdfFile``): see _safe_output_filename."""
+    return _safe_output_filename(name, fallback, (".pdf",))
+
+
+def _safe_html_filename(name, fallback: str = RESULTS_HTML_FILENAME) -> str:
+    """The podium page's name (``catFile``, normally ``CAT###RS.htm`` from the
+    index): see _safe_output_filename; ``.htm`` or ``.html``."""
+    return _safe_output_filename(name, fallback, (".htm", ".html"))
+
+
+def _output_blob(folder: str, filename: str) -> str:
+    """``<folder>/output/<filename>``, refusing anything that would not stay a
+    single file inside that record's output folder (belt and braces behind the
+    filename sanitizers)."""
+    if (not filename or filename in (".", "..") or "/" in filename or "\\" in filename
+            or not folder or "/" in folder or "\\" in folder or folder in (".", "..")):
+        raise ValueError("unsafe output blob name")
+    blob = f"{folder}/output/{filename}"
+    if not blob.startswith(f"{folder}/output/"):
+        raise ValueError("unsafe output blob name")
+    return blob
 
 # Hosts the parse_index endpoint may fetch (SSRF guard). Override via env
-# INDEX_ALLOWED_HOSTS (comma-separated); defaults to the public results service.
+# INDEX_ALLOWED_HOSTS (comma-separated host names; only port 443 is ever
+# fetched); defaults to the public results service.
 INDEX_ALLOWED_HOSTS = [
     h.strip()
     for h in os.environ.get(
@@ -82,6 +126,10 @@ INDEX_ALLOWED_HOSTS = [
     ).split(",")
     if h.strip()
 ]
+INDEX_URL_REJECTED_MESSAGE = (
+    "Not a supported index page link. Paste the competition's https index.htm "
+    "address from the results service."
+)
 
 # Automatic competition deletion. The tool has no retention clock of its own:
 # every new row is bound to a platform competition (PlatformId, see
@@ -296,6 +344,22 @@ def get_container_client(blob_service_client):
 def sanitize_name(name: str) -> str:
     """Keep alphanumerics, spaces, hyphens, underscores; trim. Used for the blob folder."""
     return "".join([c for c in name if c.isalnum() or c in (' ', '-', '_')]).strip()
+
+
+# Folder names embed the derived record name; capped so a long competition or
+# category value cannot push a blob name past the service limit.
+MAX_FOLDER_NAME = 100
+
+
+def _record_folder(name: str, record_id: str, fallback: str) -> str:
+    """``<sanitized name>-<id>``: a single path segment (no separator, no dot)."""
+    safe = sanitize_name(name or "")[:MAX_FOLDER_NAME].strip() or fallback
+    return f"{safe}-{record_id}"
+
+
+# Record ids are 8 hex characters (generate_competition_id); a looser shape is
+# accepted for safety, anything else is treated as an unknown record.
+_RECORD_ID_RE = re.compile(r"[0-9A-Za-z_-]{1,64}")
 
 
 def generate_competition_id(comp_table) -> str:
@@ -537,17 +601,21 @@ def _generated_blob_name(paper, folder_path):
     taken from it (the URL itself is never returned again). The first
     candidate inside the record's own output folder wins — BlobName, the old
     URL's path, then ``<folder>/output/<FileName>`` — so a link never points
-    outside it."""
+    outside it: the part after the prefix must be one plain file name (no
+    separator, not ``.``/``..``, which Blob Storage would resolve)."""
     prefix = f"{folder_path.strip('/')}/output/"
     candidates = [paper.get("BlobName")]
     if paper.get("Url"):
         path = unquote(urlparse(str(paper["Url"])).path).lstrip("/")
         container_name, _, rest = path.partition("/")
         candidates.append(rest if container_name == CONTAINER_NAME else None)
-    if paper.get("FileName"):
+    if isinstance(paper.get("FileName"), str) and paper["FileName"]:
         candidates.append(f"{prefix}{paper['FileName']}")
     for blob_name in candidates:
-        if isinstance(blob_name, str) and blob_name.startswith(prefix) and blob_name != prefix:
+        if not isinstance(blob_name, str) or not blob_name.startswith(prefix):
+            continue
+        rest = blob_name[len(prefix):]
+        if rest and rest not in (".", "..") and "/" not in rest and "\\" not in rest:
             return blob_name
     return None
 
@@ -648,12 +716,11 @@ def generate(req: func.HttpRequest) -> func.HttpResponse:
             pass
 
         new_id = generate_competition_id(comp_table)
-        safe = sanitize_name(name) or "scores"
-        folder = f"{safe}-{new_id}"
+        folder = _record_folder(name, new_id, "scores")
 
         container = get_container_client(blob_service_client)
         container.upload_blob(f"{folder}/source.pdf", pdf_bytes, overwrite=True)
-        out_blob = f"{folder}/output/{OUTPUT_FILENAME}"
+        out_blob = _output_blob(folder, OUTPUT_FILENAME)
         container.upload_blob(out_blob, output_bytes, overwrite=True)
 
         now = _utcnow()
@@ -708,10 +775,14 @@ def parse_index(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         html = fetch_index_html(url, allowed_hosts=INDEX_ALLOWED_HOSTS)
-    except ValueError as e:
-        return func.HttpResponse(str(e), status_code=400)
+    except IndexUrlRejected as e:
+        # Fixed wording: the caller's input is never echoed back.
+        logging.info(f"Index URL rejected: {e.code}")
+        return func.HttpResponse(INDEX_URL_REJECTED_MESSAGE, status_code=400)
     except Exception as e:
-        logging.warning(f"Could not fetch index page {url}: {e}")
+        # One answer for every fetch failure (unreachable, refused redirect,
+        # non-public address, too large), so it says nothing about the target.
+        logging.warning(f"Could not fetch index page: {getattr(e, 'code', type(e).__name__)}")
         return func.HttpResponse("Could not fetch the index page.", status_code=502)
 
     meta = parse_index_html(html)
@@ -785,22 +856,32 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
     # Proper-case category name from the index (e.g. "Tulokkaat L1") for the
     # native CAT###RS.htm caption; the `category` field above is the PDF badge.
     category_full = ""
+    idx = matched = None
     if index_url:
         try:
             idx = parse_index_html(fetch_index_html(index_url, allowed_hosts=INDEX_ALLOWED_HOSTS))
-            competition = competition or idx.competition
-            date = date or idx.date
-            venue = venue or idx.venue
-            matched = match_category(idx, segment)
-            if matched:
-                category = category or matched.name
-                cat_file = cat_file or matched.cat_file
-            # Caption name: prefer the explicitly selected CAT page, else the match.
-            selected = next((c for c in idx.categories if c.cat_file == cat_file), None) or matched
-            if selected:
-                category_full = selected.name
         except Exception as e:
-            logging.warning(f"Could not use index URL {index_url}: {e}")
+            logging.warning(f"Could not use the index URL: {getattr(e, 'code', type(e).__name__)}")
+    if idx is not None:
+        competition = competition or idx.competition
+        date = date or idx.date
+        venue = venue or idx.venue
+        matched = match_category(idx, segment)
+        if matched:
+            category = category or matched.name
+            cat_file = cat_file or matched.cat_file
+
+    # One sanitised page name from here on — the caption lookup, the blob, the
+    # rows and the response. catFile is normally a CAT###RS.htm name from the
+    # index; anything else is reduced to a plain .htm/.html file name inside
+    # this record's folder.
+    html_filename = _safe_html_filename(cat_file)
+
+    if idx is not None:
+        # Caption name: prefer the explicitly selected CAT page, else the match.
+        selected = next((c for c in idx.categories if c.cat_file == html_filename), None) or matched
+        if selected:
+            category_full = selected.name
 
     meta = ResultsMeta(
         competition=competition,
@@ -819,7 +900,6 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Error rendering results: {e}", exc_info=True)
         return func.HttpResponse("Could not render the results page.", status_code=500)
 
-    html_filename = cat_file or "results.htm"
     name = " — ".join([x for x in (meta.category, meta.competition) if x]) or "Results"
 
     # Download filename for the results PDF. Tulokkaat re-uses the standard FSM
@@ -847,13 +927,12 @@ def generate_results(req: func.HttpRequest) -> func.HttpResponse:
             pass
 
         new_id = generate_competition_id(comp_table)
-        safe = sanitize_name(name) or "results"
-        folder = f"{safe}-{new_id}"
+        folder = _record_folder(name, new_id, "results")
+        pdf_blob = _output_blob(folder, pdf_filename)
+        html_blob = _output_blob(folder, html_filename)
 
         container = get_container_client(blob_service_client)
         container.upload_blob(f"{folder}/source.pdf", pdf_bytes, overwrite=True)
-        pdf_blob = f"{folder}/output/{pdf_filename}"
-        html_blob = f"{folder}/output/{html_filename}"
         container.upload_blob(pdf_blob, results_pdf, overwrite=True)
         container.upload_blob(html_blob, results_html, overwrite=True)
 
@@ -908,6 +987,8 @@ def _load_competition_for(user: User, comp_id: str, need: str):
     """The competitions row ``comp_id`` when the caller has ``need`` on its
     platform competition. An unknown record answers exactly like one the caller
     may not see (404 platform_not_found); see _require_platform_access."""
+    if not isinstance(comp_id, str) or not _RECORD_ID_RE.fullmatch(comp_id):
+        raise PlatformBindingError(404, "platform_not_found")
     entity = get_competition_entity(comp_id)
     if not entity:
         raise PlatformBindingError(404, "platform_not_found")

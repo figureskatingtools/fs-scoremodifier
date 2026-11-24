@@ -142,9 +142,21 @@ def test_parse_index_endpoint(monkeypatch):
     # SSRF guard: real fetch, host outside INDEX_ALLOWED_HOSTS -> 400 before any network I/O.
     resp = call(fa.parse_index, make_request("parse_index", method="GET", params={"url": "https://169.254.169.254/latest/meta-data"}))
     assert resp.status_code == 400
-    assert b"Host not allowed" in resp.get_body()
+    assert resp.get_body().decode() == fa.INDEX_URL_REJECTED_MESSAGE
+    assert b"169.254" not in resp.get_body()
     resp = call(fa.parse_index, make_request("parse_index", method="GET", params={"url": "file:///etc/passwd"}))
     assert resp.status_code == 400
+    # Plain http on an allowed host with a non-default port: refused, nothing echoed.
+    resp = call(fa.parse_index, make_request("parse_index", method="GET", params={"url": "http://www.figureskatingresults.fi:8080/x"}))
+    assert resp.status_code == 400 and b"8080" not in resp.get_body()
+
+    # Any fetch failure is one 502 that says nothing about the target.
+    def refused(url, *, allowed_hosts=None, timeout=10.0):
+        raise index_meta.IndexFetchError("redirect_host_not_allowed")
+
+    monkeypatch.setattr(fa, "fetch_index_html", refused)
+    resp = call(fa.parse_index, make_request("parse_index", method="GET", params={"url": "https://www.figureskatingresults.fi/x/index.htm"}))
+    assert resp.status_code == 502 and resp.get_body() == b"Could not fetch the index page."
 
     monkeypatch.setattr(fa, "fetch_index_html", lambda url, *, allowed_hosts=None, timeout=10.0: INDEX_HTML)
     resp = call(fa.parse_index, make_request("parse_index", method="GET", params={"url": "https://www.figureskatingresults.fi/results/2526/X/index.htm"}))
@@ -161,3 +173,102 @@ def test_parse_index_endpoint(monkeypatch):
 def test_safe_pdf_filename(bad):
     out = fa._safe_pdf_filename(bad, "fallback.pdf")
     assert out.lower().endswith(".pdf") and "/" not in out and "\\" not in out
+
+
+# ── catFile: the podium page's blob name ──────────────────────────────────────
+
+@pytest.mark.parametrize("value, expected", [
+    ("CAT001RS.htm", "CAT001RS.htm"),          # what the site sends (from parse_index)
+    ("CAT012RS.HTML", "CAT012RS.HTML"),
+    ("", "results.htm"),
+    ("CAT003RS", "CAT003RS.htm"),
+    ("../other-bbbbbbbb/output/x.htm", "x.htm"),
+    ("..\\..\\x.htm", "x.htm"),
+    ("evil.js", "evil.js.htm"),
+    ("a<b>?#%.htm", "ab.htm"),
+    ("..", "results.htm"),
+    ("../..", "results.htm"),
+    (".htm", "results.htm"),
+    ("dir/", "results.htm"),
+    ("x\x00\n.htm", "x.htm"),
+    (None, "results.htm"),
+    (["CAT001RS.htm"], "results.htm"),
+    (7, "results.htm"),
+])
+def test_safe_html_filename(value, expected):
+    assert fa._safe_html_filename(value) == expected
+
+
+def test_safe_html_filename_caps_the_length():
+    out = fa._safe_html_filename("A" * 500 + ".htm")
+    assert len(out) == fa.MAX_OUTPUT_FILENAME and out.endswith(".htm")
+
+
+@pytest.mark.parametrize("folder, name", [
+    ("Cup-aaaaaaaa", ".."), ("Cup-aaaaaaaa", "../x.htm"), ("Cup-aaaaaaaa", "a\\b.htm"),
+    ("Cup-aaaaaaaa", ""), ("..", "x.htm"), ("a/b", "x.htm"), ("", "x.htm"),
+])
+def test_output_blob_refuses_anything_outside_the_output_folder(folder, name):
+    with pytest.raises(ValueError):
+        fa._output_blob(folder, name)
+    assert fa._output_blob("Cup-aaaaaaaa", "CAT001RS.htm") == "Cup-aaaaaaaa/output/CAT001RS.htm"
+
+
+@pytest.fixture
+def fake_results(monkeypatch):
+    monkeypatch.setattr(fa, "extract_results", lambda pdf: ([], "TULOKKAAT"))
+    monkeypatch.setattr(fa, "render_results_pdf", lambda meta, teams: b"%PDF-results")
+    monkeypatch.setattr(fa, "render_results_html", lambda meta, teams: "<html></html>")
+
+
+@pytest.mark.parametrize("cat_file, expected", [
+    ("CAT001RS.htm", "CAT001RS.htm"),
+    ("../other-bbbbbbbb/output/CAT001RS.htm", "CAT001RS.htm"),
+    ("../../x", "x.htm"),
+    ("..", "results.htm"),
+])
+def test_cat_file_stays_inside_the_records_output_folder(synthetic_pdf, storage, fake_results, cat_file, expected):
+    victim = "Other-bbbbbbbb/output/CAT001RS.htm"
+    storage.blobs[victim] = b"published page"
+    resp, body = _run(synthetic_pdf, {"catFile": cat_file})
+    assert resp.status_code == 200, resp.get_body()
+    assert body["htmlFileName"] == expected
+    row = storage.competitions[("GLOBAL", body["id"])]
+    folder = row["FolderPath"]
+    assert row["CatFile"] == expected
+    assert storage.blobs[f"{folder}/output/{expected}"] == b"<html></html>"
+    assert storage.papers[(body["id"], expected)]["BlobName"] == f"{folder}/output/{expected}"
+    assert storage.blobs[victim] == b"published page"
+    written = {name for name in storage.blobs if name != victim}
+    assert all(name.startswith(f"{folder}/") and ".." not in name.split("/") for name in written)
+
+
+def test_long_names_keep_the_folder_short(synthetic_pdf, storage, fake_results):
+    resp, body = _run(synthetic_pdf, {"competition": "C" * 2000, "category": "K"})
+    assert resp.status_code == 200, resp.get_body()
+    folder = storage.competitions[("GLOBAL", body["id"])]["FolderPath"]
+    assert len(folder) <= fa.MAX_FOLDER_NAME + 1 + 8 and "/" not in folder
+
+
+@pytest.mark.parametrize("cat_file", ["../CAT003RS.htm", "../../x/CAT003RS.htm", "CAT003RS"])
+def test_normalised_cat_file_picks_its_own_caption(synthetic_pdf, storage, fake_results, monkeypatch, cat_file):
+    # The caption lookup uses the same normalised name as the stored page, so
+    # the page is never saved under one category's name with another's caption.
+    monkeypatch.setattr(fa, "fetch_index_html", lambda url, *, allowed_hosts=None, timeout=10.0: INDEX_HTML)
+    seen = {}
+    monkeypatch.setattr(fa, "render_results_html", lambda meta, teams: seen.setdefault("meta", meta) and "<html></html>")
+    resp, body = _run(synthetic_pdf, {"catFile": cat_file, "indexUrl": "https://www.figureskatingresults.fi/r/index.htm"})
+    assert resp.status_code == 200, resp.get_body()
+    assert body["htmlFileName"] == "CAT003RS.htm"
+    assert seen["meta"].category_full == "Noviisit L1"
+    row = storage.competitions[("GLOBAL", body["id"])]
+    assert row["CatFile"] == "CAT003RS.htm"
+    assert f"{row['FolderPath']}/output/CAT003RS.htm" in storage.blobs
+
+
+def test_blank_cat_file_still_auto_matches_from_the_index(synthetic_pdf, storage, fake_results, monkeypatch):
+    monkeypatch.setattr(fa, "fetch_index_html", lambda url, *, allowed_hosts=None, timeout=10.0: INDEX_HTML)
+    resp, body = _run(synthetic_pdf, {"indexUrl": "https://www.figureskatingresults.fi/r/index.htm"})
+    assert resp.status_code == 200, resp.get_body()
+    # fake_results' segment "TULOKKAAT" matches "Tulokkaat L1".
+    assert body["htmlFileName"] == "CAT001RS.htm"

@@ -117,11 +117,28 @@ Four pieces:
    (POST, body = the PDF, metadata via query params `competition/date/venue/category/supertitle/catFile/indexUrl`):
    runs `extract_results` → `render_results_pdf` + `render_results_html`, stores `output/results.pdf`
    + `output/<CAT###RS>.htm`, writes a `competitions` row (`Tool="results"`) + a `generatedpapers` row
-   per file, returns fresh 15-minute URLs for both. Both generators **require** a **`platformId`** query param (the
+   per file, returns fresh 15-minute URLs for both. `pdfFile` and `catFile` are **normalised, never
+   rejected** (`_safe_output_filename`: last path segment only, letters/digits/space/`-`/`_`/`.`, ≤ 120
+   chars, `.pdf` resp. `.htm`/`.html` enforced, fallback `results.pdf`/`results.htm` for an empty,
+   dots-only or non-string value), and every output blob goes through `_output_blob`, which refuses
+   anything but one file name under `<folder>/output/`; download links (`_generated_blob_name`) accept
+   only such a single segment too. Both generators **require** a **`platformId`** query param (the
    site's active competition GUID; normalized; missing/malformed → 400 `platform_id_required`),
    stored as `PlatformId` on the row — see *Retention* below. **`parse_index`** (GET `?url=`) fetches + parses the competition
    index.htm (SSRF-guarded to `INDEX_ALLOWED_HOSTS`, default `figureskatingresults.fi`) → name/date/venue
-   + category `CAT###RS.htm` list. `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
+   + category `CAT###RS.htm` list. The guard (`index_meta.fetch_index_html`): https only (a pasted
+   `http://` link on port 80 is upgraded before anything is sent), no credentials, **port 443 only**
+   (also in CLI mode and on every redirect hop; `INDEX_ALLOWED_HOSTS` entries are host names — `host:443`
+   means the host, any other `host:port` entry never matches), every
+   DNS answer must be a public address (connects to the checked IPs in order, never resolving again,
+   SNI/cert on the name), redirects followed by hand ≤ 3 hops with each re-checked (https +
+   allow-list + port, no downgrade), body ≤ 2 MiB and complete (a non-chunked response shorter than
+   its `Content-Length` is a failure), **one 20 s budget** for the whole fetch — DNS (lookup in a
+   daemon thread, abandoned at the deadline; at most `MAX_DNS_LOOKUPS` = 8 in flight, a further fetch fails at once), each TCP connect and TLS handshake (the remaining time
+   is re-read before each phase and each address attempt), and the transfer (a watchdog, armed before
+   the first connection and handed every socket before its handshake, shuts it down at the deadline;
+   plus a deadline check before every `read1`). A rejected URL is 400 with fixed wording (nothing echoed); every fetch failure is the
+   same 502. Tests: `tests/test_index_fetch.py` (fake DNS/connection, plus the real `http.client` over a socket pair and the real `_open_connection` against a loopback TLS server with a throwaway `openssl` certificate — name check, stalled handshake/headers/body; no network). `check_user_permission` is the frontend auth probe. `list_competitions` / `get_competition_details` / `delete_competition`
    and the daily auto-delete timer are mirrored from judgepapers for
    future features / storage hygiene (not wired to the current UI). The auth/storage/SAS helpers are reused verbatim from
    judgepapers. **The function imports `scoremodifier.per_skater`**; the canonical package lives at the
@@ -229,7 +246,9 @@ fs-judgepapers and fs-protocolgenerator** (its docstring is the contract).
   `DeletedBy="user"|"auto-cleanup"`; every sweep also runs `_scrub_hidden_rows()`, blanking any
   other `CreatedBy`/`DeletedBy` value on `Visible=false` rows. `CreatedBy` is the only user
   identifier this tool stores (no blob metadata, nothing in `generatedpapers`). Logs never carry
-  addresses (the no-identity warning lists header names only) and are kept **90 days**:
+  addresses (the no-identity warning lists header names only; the Azure SDK's per-request URL
+  logger `azure.core.pipeline.policies.http_logging_policy` is capped at WARNING at import of
+  `function_app.py`, since `host.json` levels do not reach Python loggers) and are kept **90 days**:
   `function.bicep` links App Insights to its own Log Analytics workspace
   `log-fs-scoremodifier-<env>` (`retentionInDays: 90`) and sets `RetentionInDays: 90` on the
   component (`logRetentionDays`).

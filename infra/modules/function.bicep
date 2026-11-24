@@ -84,6 +84,9 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   }
   properties: {
     serverFarmId: appServicePlan.id
+    // Plain HTTP is redirected to HTTPS: the router's hop carries the proxy
+    // secret and the forwarded identity, which must never travel in clear.
+    httpsOnly: true
     siteConfig: {
       cors: {
         allowedOrigins: allowedOrigins
